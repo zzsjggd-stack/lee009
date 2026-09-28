@@ -1,0 +1,163 @@
+
+export async function resolveMedia(mediaId: string): Promise<{ base64: string, mimeType: string } | null> {
+  try {
+    const media = await Flow.media.select({ id: mediaId });
+    if (media && media.base64) {
+      return { base64: media.base64, mimeType: media.mimeType };
+    }
+    return null;
+  } catch (error) {
+    console.warn(`Failed to resolve media for ID: ${mediaId}`, error);
+    return null;
+  }
+}
+/**
+ * Checks if a video was generated from the current storyboard frame.
+ */
+export const videoStaleReason = (v: any, shot: any): 'frame' | 'duration' | 'content' | null => {
+  if (!v || !shot) return null;
+  if (v.sourceFrameMediaId && v.sourceFrameMediaId !== shot.firstFrameMediaId) return 'frame';
+  if (v.durationSeconds && shot.duration && Number(v.durationSeconds) !== Number(shot.duration)) return 'duration';
+  if (v.sourceKey && v.sourceKey !== videoContentKey(shot)) return 'content';
+  return null;
+};
+export const isVideoValid = (v: any, storyboard: any[]) => {
+  const shot = storyboard.find(s => s.id === v.shotId);
+  return !!shot && !videoStaleReason(v, shot);
+};
+/**
+ * Detects extension from base64 header if possible.
+ */
+function getExtensionFromBase64(b64: string): string {
+  const header = b64.substring(0, 5);
+  if (header.startsWith('/9j/')) return 'jpg';
+  if (header.startsWith('iVBOR')) return 'png';
+  return 'png'; // Fallback
+}
+/** Sanitize a filename for safe download/ZIP usage. */
+export function sanitizeFilename(name: string, index: number, mimeType: string, suffix?: string): string {
+  const ext = mimeType.split('/')[1]?.replace('jpeg', 'jpg') || (mimeType.includes('video') ? 'mp4' : 'png');
+  const clean = name
+    .replace(/[^a-zA-Z0-9_\-ก-๙]/g, '_')  // Replace unsafe chars, keeping Thai
+    .replace(/_+/g, '_')                // Collapse runs
+    .slice(0, 50);                      // Cap length
+  
+  const midFix = suffix ? `_${suffix}` : '';
+  return `${clean || 'file'}${midFix}.${ext}`;
+}
+export interface BundleReport {
+  failedFiles: string[];
+  skippedVideos: string[];
+}
+/**
+ * Bundles the entire project state and all its media into a structured ZIP.
+ * Fetches missing base64 data sequentially if mediaId is present.
+ */
+export async function bundleProjectZip(
+  state: AppState, 
+  onProgress?: (text: string) => void
+): Promise<BundleReport> {
+  const JSZip = (await import('jszip')).default;
+  const zip = new JSZip();
+  const failedFiles: string[] = [];
+  
+  const MAX_ZIP_B64 = 300_000_000; // ประมาณ 220 MB กันเกินขีดจำกัดเบราว์เซอร์
+  let totalB64 = 0;
+  const skippedVideos: string[] = [];
+  // 1. Sanitize and add project.json
+  const sanitizedState = sanitizeStateForStorage(state);
+  zip.file('project.json', JSON.stringify(sanitizedState, null, 2));
+  // Collect all tasks that might require fetching
+  const assetTasks = state.assets.map(a => ({ type: 'asset', data: a }));
+  const shotTasks = state.storyboard.map(s => ({ type: 'shot', data: s }));
+  const videoTasks = state.videos.filter(v => isVideoValid(v, state.storyboard)).map(v => ({ type: 'video', data: v }));
+  
+  const allTasks = [...assetTasks, ...shotTasks, ...videoTasks];
+  const total = allTasks.length;
+  // Process sequentially to avoid SDK concurrency issues
+  for (let i = 0; i < allTasks.length; i++) {
+    const task = allTasks[i];
+    const currentNum = i + 1;
+    if (onProgress) onProgress(`กำลังดึงไฟล์ ${currentNum}/${total}`);
+    if (task.type === 'asset') {
+      const asset = task.data as any;
+      let b64 = asset.referenceBase64;
+      let mime = asset.referenceMimeType || 'image/png';
+      
+      if (!b64 && asset.referenceMediaId) {
+        const resolved = await resolveMedia(asset.referenceMediaId);
+        if (resolved) {
+          b64 = resolved.base64;
+          mime = resolved.mimeType;
+        } else {
+          failedFiles.push(`Asset: ${asset.name} (${asset.id})`);
+        }
+      }
+      if (b64) {
+        totalB64 += b64.length;
+        const assetFolder = zip.folder('assets');
+        const ext = (mime.split('/')[1] || 'png').replace('jpeg', 'jpg');
+        const filename = `${asset.id.replace('@', '')}.${ext}`;
+        assetFolder?.file(filename, b64, { base64: true });
+      }
+    } 
+    else if (task.type === 'shot') {
+      const shot = task.data as any;
+      let b64 = shot.firstFrameBase64;
+      
+      if (!b64 && shot.firstFrameMediaId) {
+        const resolved = await resolveMedia(shot.firstFrameMediaId);
+        if (resolved) {
+          b64 = resolved.base64;
+        } else {
+          failedFiles.push(`Shot Frame: ${shot.shotNumber}`);
+        }
+      }
+      if (b64) {
+        totalB64 += b64.length;
+        const storyboardFolder = zip.folder('storyboard');
+        const ext = getExtensionFromBase64(b64);
+        const filename = `shot_${shot.shotNumber.toString().padStart(2, '0')}_frame.${ext}`;
+        storyboardFolder?.file(filename, b64, { base64: true });
+      }
+    }
+    else if (task.type === 'video') {
+      const v = task.data as any;
+      let b64 = v.videoBase64;
+      let mime = v.mimeType || 'video/mp4';
+      const shot = state.storyboard.find(s => s.id === v.shotId);
+      const shotNum = (shot?.shotNumber || 0).toString().padStart(2, '0');
+      if (!b64 && v.videoMediaId) {
+        const resolved = await resolveMedia(v.videoMediaId);
+        if (resolved) {
+          b64 = resolved.base64;
+          mime = resolved.mimeType;
+        } else {
+          failedFiles.push(`Video Shot: ${shot?.shotNumber || '?'}`);
+        }
+      }
+      if (b64) {
+        if (totalB64 + b64.length > MAX_ZIP_B64) {
+          skippedVideos.push(shotNum);
+        } else {
+          totalB64 += b64.length;
+          const videoFolder = zip.folder('videos');
+          const filename = `shot_${shotNum}_video.mp4`;
+          videoFolder?.file(filename, b64, { base64: true });
+        }
+      }
+    }
+  }
+  if (onProgress) onProgress('กำลังสร้างไฟล์ ZIP...');
+  const blob = await zip.generateAsync({ type: 'blob' });
+  const base64 = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || '').split(',')[1] || '');
+    reader.onerror = () => reject(new Error('แปลงไฟล์ ZIP ไม่สำเร็จ (ไฟล์อาจใหญ่เกิน)'));
+    reader.readAsDataURL(blob);
+  });
+  if (!base64) throw new Error('แปลงไฟล์ ZIP ไม่สำเร็จ (ไฟล์อาจใหญ่เกิน)');
+  const date = new Date().toISOString().split('T')[0];
+  await Flow.download({ base64, mimeType: 'application/zip', filename: `G2_Project_${date}.zip` });
+  return { failedFiles, skippedVideos };
+}

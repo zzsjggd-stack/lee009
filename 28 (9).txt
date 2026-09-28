@@ -1,0 +1,325 @@
+import { copyToClipboard } from '../lib/clipboard';
+interface Props {
+  state: AppState;
+  onReset: () => void;
+  onNavigate?: (step: number) => void;
+}
+const fmt = (s: number) => {
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
+};
+export const Step6Export: React.FC<Props> = ({ state, onReset, onNavigate }) => {
+  const [bundling, setBundling] = useState(false);
+  const [bundleProgress, setBundleProgress] = useState<string | null>(null);
+  const [bundleReport, setBundleReport] = useState<{ failedFiles: string[]; skippedVideos: string[] } | null>(null);
+  const [showResetConfirm, setShowResetConfirm] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [downloading, setDownloading] = useState(false);
+  const [videoProgress, setVideoProgress] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [showMenu, setShowMenu] = useState(false);
+  
+  const [vidCache, setVidCache] = useState<Record<string, { base64: string; mimeType: string } | 'loading' | 'failed'>>({});
+  const requestedRef = useRef<Set<string>>(new Set());
+  const keepRef = useRef<string[]>([]);
+  const [frameCache, setFrameCache] = useState<Record<string, string>>({});
+  const frameReqRef = useRef<Set<string>>(new Set());
+  const [index, setIndex] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [muted, setMuted] = useState(false);
+  const [loopAll, setLoopAll] = useState(true);
+  const [clipTime, setClipTime] = useState(0);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const validVideos = useMemo(() => state.videos.filter(v => isVideoValid(v, state.storyboard)), [state.videos, state.storyboard]);
+  const shots = useMemo(() => [...state.storyboard].sort((a, b) => a.shotNumber - b.shotNumber), [state.storyboard]);
+  const videoOf = (shotId: string) => validVideos.find(v => v.shotId === shotId);
+  const durOf = (s: Shot) => Number(s.duration) || Number(state.config.videoDuration) || 8;
+  const totalDur = useMemo(() => shots.reduce((sum, s) => sum + durOf(s), 0), [shots, state.config.videoDuration]);
+  const startOf = (i: number) => shots.slice(0, i).reduce((sum, s) => sum + durOf(s), 0);
+  const current = shots[index];
+  const currentVideo = current ? videoOf(current.id) : undefined;
+  
+  const cached = currentVideo?.videoMediaId ? vidCache[currentVideo.videoMediaId] : undefined;
+  const cachedClip = cached && typeof cached === 'object' ? cached : null;
+  keepRef.current = [shots[index], shots[index + 1]].map(s => (s && videoOf(s.id)?.videoMediaId) || '').filter(Boolean);
+  
+  const playableSrc = currentVideo?.videoBase64
+    ? `data:${currentVideo.mimeType || 'video/mp4'};base64,${currentVideo.videoBase64}`
+    : cachedClip ? `data:${cachedClip.mimeType || 'video/mp4'};base64,${cachedClip.base64}` : null;
+    
+  const isVertical = state.config.aspectRatio === '9:16' || state.config.aspectRatio === '4:5';
+  const calcMB = (b64?: string) => (b64 ? (b64.length * 0.75) / (1024 * 1024) : 0);
+  const summary = useMemo(() => {
+    let mb = 0;
+    state.assets.forEach(a => { mb += calcMB(a.referenceBase64); });
+    state.storyboard.forEach(s => { mb += calcMB(s.firstFrameBase64); });
+    validVideos.forEach(v => { mb += calcMB(v.videoBase64); });
+    return { videoCount: validVideos.length, totalMB: mb.toFixed(1) };
+  }, [state.assets, state.storyboard, validVideos]);
+  const goTo = (i: number) => { setIndex(Math.max(0, Math.min(shots.length - 1, i))); setClipTime(0); };
+  const goNext = () => {
+    if (index >= shots.length - 1) { if (loopAll) goTo(0); else setPlaying(false); return; }
+    goTo(index + 1);
+  };
+  
+  useEffect(() => {
+    [shots[index], shots[index + 1]].forEach(s => {
+      const v = s ? videoOf(s.id) : undefined;
+      if (!v || v.videoBase64 || !v.videoMediaId || requestedRef.current.has(v.videoMediaId)) return;
+      const id = v.videoMediaId;
+      requestedRef.current.add(id);
+      setVidCache(p => ({ ...p, [id]: 'loading' }));
+      resolveMedia(id).then(r => {
+        if (!r) requestedRef.current.delete(id);
+        setVidCache(p => {
+          const n = { ...p, [id]: r || 'failed' };
+          const loaded = Object.keys(n).filter(k => typeof n[k] === 'object' && !keepRef.current.includes(k));
+          while (loaded.length > 4) {
+            const old = loaded.shift()!;
+            delete n[old];
+            requestedRef.current.delete(old);
+          }
+          return n;
+        });
+      });
+    });
+  }, [index, shots, validVideos]);
+  // ภาพนิ่งของช็อตที่กำลังดูและช็อตถัดไป โหลดจากคลัง Flow เมื่อจำเป็น
+  const frameOf = (s?: Shot) => s ? (s.firstFrameBase64 || (s.firstFrameMediaId ? frameCache[s.firstFrameMediaId] : undefined)) : undefined;
+  useEffect(() => {
+    [shots[index], shots[index + 1]].forEach(s => {
+      if (!s || s.firstFrameBase64 || !s.firstFrameMediaId || frameReqRef.current.has(s.firstFrameMediaId)) return;
+      const id = s.firstFrameMediaId;
+      frameReqRef.current.add(id);
+      resolveMedia(id).then(r => { if (r) setFrameCache(p => ({ ...p, [id]: r.base64 })); });
+    });
+  }, [index, shots]);
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    if (playing) v.play().catch(() => {});
+    else v.pause();
+  }, [playing, index, playableSrc]);
+  useEffect(() => {
+    if (!playing || playableSrc || !current || cached === 'loading') return;
+    const t = setTimeout(goNext, 2000);
+    return () => clearTimeout(t);
+  }, [playing, playableSrc, index, current, cached]);
+  useEffect(() => {
+    if (!showMenu) return;
+    const onDown = (e: MouseEvent) => { if (!menuRef.current?.contains(e.target as Node)) setShowMenu(false); };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [showMenu]);
+  const handleFullExport = async () => {
+    setBundling(true); setErrorMessage(null); setBundleReport(null);
+    try { 
+      const result = await bundleProjectZip(state, (t) => setBundleProgress(t)); 
+      setBundleReport(result);
+    }
+    catch (err) { 
+      console.error('Export error:', err);
+      setErrorMessage('ดาวน์โหลดไม่สำเร็จ ลองอีกครั้ง'); 
+    }
+    finally { setBundling(false); setBundleProgress(null); }
+  };
+  const handleSaveAndReset = async () => {
+    setBundling(true); setBundleReport(null);
+    try { 
+      const r = await bundleProjectZip(state, (t) => setBundleProgress(t)); 
+      if (r.skippedVideos.length) alert(`บันทึกแล้ว แต่ไม่ได้ใส่วิดีโอ ${r.skippedVideos.length} คลิปเพราะไฟล์ใหญ่เกิน — วิดีโอยังอยู่ในคลัง Flow`);
+      onReset(); 
+    }
+    catch (err) { 
+      console.error('Reset save error:', err);
+      setErrorMessage('บันทึกและล้างไม่สำเร็จ'); 
+    }
+    finally { setBundling(false); setBundleProgress(null); setShowResetConfirm(false); }
+  };
+  const downloadOne = async (shot: Shot) => {
+    const v = videoOf(shot.id);
+    if (!v) return;
+    let b64 = v.videoBase64; let mime = v.mimeType || 'video/mp4';
+    try {
+      if (!b64 && v.videoMediaId) { const r = await resolveMedia(v.videoMediaId); if (r) { b64 = r.base64; mime = r.mimeType; } }
+      if (b64) await Flow.download({ base64: b64, mimeType: mime, filename: `shot_${String(shot.shotNumber).padStart(2, '0')}_video.mp4` });
+      else setErrorMessage('ดาวน์โหลดคลิปนี้ไม่ได้');
+    } catch (e) {
+      setErrorMessage('เกิดข้อผิดพลาดในการดาวน์โหลด');
+    }
+  };
+  const handleIndividualVideoDownload = async () => {
+    setDownloading(true); setErrorMessage(null); setShowMenu(false);
+    let failed = 0;
+    try {
+      for (let i = 0; i < validVideos.length; i++) {
+        const v = validVideos[i];
+        const shot = shots.find(s => s.id === v.shotId);
+        setVideoProgress(`กำลังโหลดวิดีโอ ${i + 1}/${validVideos.length}`);
+        let b64 = v.videoBase64; let mime = v.mimeType || 'video/mp4';
+        if (!b64 && v.videoMediaId) { const r = await resolveMedia(v.videoMediaId); if (r) { b64 = r.base64; mime = r.mimeType; } }
+        if (b64) await Flow.download({ base64: b64, mimeType: mime, filename: `shot_${String(shot?.shotNumber || 0).padStart(2, '0')}_video.mp4` });
+        else failed++;
+      }
+      if (failed > 0) setErrorMessage(`ดาวน์โหลดไม่ได้ ${failed} คลิป`);
+    } catch { setErrorMessage('ดาวน์โหลดวิดีโอบางส่วนไม่สำเร็จ'); }
+    finally { setDownloading(false); setVideoProgress(null); }
+  };
+  const handleCopyPrompts = async () => {
+    const content = shots.map(s => `SHOT ${s.shotNumber} [${s.cameraAngle}]\n${s.description}${s.dialogue ? `\nบทพูด: ${s.dialogue}` : ''}\n`).join('\n');
+    const ok = await copyToClipboard(content);
+    if (ok) {
+      setCopied(true); setShowMenu(false);
+      setTimeout(() => setCopied(false), 2000);
+    }
+  };
+  const speaker = current ? state.assets.find(a => a.id === current.speakerId) : undefined;
+  const playedSec = current ? startOf(index) + clipTime : 0;
+  if (shots.length === 0) {
+    return (
+      <div className="py-24 flex flex-col items-center justify-center text-center gap-3 text-[var(--ui-text-muted)]">
+        <span className="material-symbols-outlined text-6xl opacity-30">movie</span>
+        <p className="font-bold">ยังไม่มีช็อต — กลับไปแบ่งช็อตที่ STEP 4</p>
+      </div>
+    );
+  }
+  return (
+    <div className="flex flex-col gap-4 pb-10">
+      <div className="flex flex-wrap items-center justify-between gap-3 bg-[var(--ui-surface)] border border-[var(--ui-border)] rounded-2xl px-5 py-3 shadow-xl">
+        <div className="flex items-center gap-4 font-bold text-[var(--ui-text-primary)]" style={{ fontSize: 'var(--fs-small)' }}>
+          <span>{shots.length} ช็อต · วิดีโอ {summary.videoCount}</span>
+          <span className="text-[var(--ui-text-muted)]">ยาว {fmt(totalDur)} · {state.config.aspectRatio} · {summary.totalMB} MB</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <button onClick={handleFullExport} disabled={bundling} className="px-5 py-2.5 bg-[var(--ui-accent)] text-black font-extrabold rounded-xl flex items-center gap-2 disabled:opacity-40 g2-cta" style={{ fontSize: 'var(--fs-small)' }}>
+            {bundling ? <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" /> : <span className="material-symbols-outlined text-lg font-bold">folder_zip</span>}
+            {bundling ? (bundleProgress || 'กำลังเตรียม...') : 'ดาวน์โหลด ZIP'}
+          </button>
+          <div className="relative" ref={menuRef}>
+            <button onClick={() => setShowMenu(!showMenu)} className="w-10 h-10 rounded-xl border border-[var(--ui-border)] bg-[var(--ui-surface-soft)] text-[var(--ui-text-primary)] flex items-center justify-center">
+              <span className="material-symbols-outlined font-bold">more_vert</span>
+            </button>
+            {showMenu && (
+              <div className="absolute right-0 top-full mt-2 z-50 w-64 bg-[var(--ui-surface-raised)] border border-[var(--ui-border)] rounded-xl shadow-2xl overflow-hidden py-1">
+                <button onClick={handleIndividualVideoDownload} disabled={downloading || validVideos.length === 0} className="w-full text-left px-4 py-3 text-xs font-bold text-[var(--ui-text-primary)] hover:bg-[var(--ui-surface-soft)] flex items-center gap-2 disabled:opacity-30">
+                  <span className="material-symbols-outlined text-sm">download</span>{downloading ? (videoProgress || 'กำลังเตรียม...') : 'โหลดเฉพาะวิดีโอทั้งหมด'}
+                </button>
+                <button onClick={handleCopyPrompts} className="w-full text-left px-4 py-3 text-xs font-bold text-[var(--ui-text-primary)] hover:bg-[var(--ui-surface-soft)] flex items-center gap-2">
+                  <span className="material-symbols-outlined text-sm">{copied ? 'check' : 'content_copy'}</span>{copied ? 'คัดลอกแล้ว' : 'คัดลอกรายการช็อตทั้งหมด'}
+                </button>
+                <div className="h-px bg-[var(--ui-border)] my-1" />
+                <button onClick={() => { setShowMenu(false); setShowResetConfirm(true); }} className="w-full text-left px-4 py-3 text-xs font-bold text-[var(--ui-danger)] hover:bg-[var(--ui-surface-soft)] flex items-center gap-2">
+                  <span className="material-symbols-outlined text-sm">refresh</span>เริ่มโปรเจกต์ใหม่
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+      {errorMessage && (
+        <div className="bg-[var(--ui-danger)]/10 border border-[var(--ui-danger)]/20 p-4 rounded-xl flex items-center justify-between text-[var(--ui-danger)]">
+          <p className="font-bold" style={{ fontSize: 'var(--fs-small)' }}>{errorMessage}</p>
+          <button onClick={() => setErrorMessage(null)} className="material-symbols-outlined text-lg">close</button>
+        </div>
+      )}
+      {bundleReport && bundleReport.failedFiles.length > 0 && (
+        <div className="bg-[var(--ui-danger)]/10 border border-[var(--ui-danger)]/20 p-4 rounded-xl text-[var(--ui-danger)] space-y-1">
+          <p className="font-black" style={{ fontSize: 'var(--fs-small)' }}>ดึงไม่ได้ {bundleReport.failedFiles.length} ไฟล์ — ไม่อยู่ใน ZIP</p>
+          <p className="font-bold opacity-80 break-words" style={{ fontSize: 'var(--fs-micro)' }}>{bundleReport.failedFiles.join(', ')}</p>
+        </div>
+      )}
+      {(bundleReport?.skippedVideos?.length || 0) > 0 && (
+        <div className="bg-amber-500/10 border border-amber-500/20 p-4 rounded-xl text-amber-500 space-y-1">
+          <p className="font-black" style={{ fontSize: 'var(--fs-small)' }}>ไม่ได้ใส่วิดีโอ {bundleReport!.skippedVideos.length} คลิปใน ZIP เพราะไฟล์ใหญ่เกิน</p>
+          <p className="font-bold opacity-80" style={{ fontSize: 'var(--fs-micro)' }}>ช็อต {bundleReport!.skippedVideos.join(', ')} — ใช้เมนู "โหลดเฉพาะวิดีโอทั้งหมด" แทน</p>
+        </div>
+      )}
+      <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
+        <div className="lg:col-span-3 bg-[var(--ui-surface)] border border-[var(--ui-border)] rounded-2xl overflow-hidden shadow-xl">
+          <div className="bg-black flex items-center justify-center relative" style={{ height: isVertical ? '56vh' : '42vh', minHeight: '260px' }}>
+            {playableSrc ? (
+              <video
+                key={current.id}
+                ref={videoRef}
+                src={playableSrc}
+                muted={muted}
+                playsInline
+                className="h-full w-auto max-w-full object-contain"
+                onTimeUpdate={(e) => setClipTime((e.target as HTMLVideoElement).currentTime)}
+                onEnded={goNext}
+              />
+            ) : frameOf(current) ? (
+              <img src={`data:image/png;base64,${frameOf(current)}`} className="h-full w-auto max-w-full object-contain opacity-70" />
+            ) : (
+              <span className="material-symbols-outlined text-white/20 text-6xl">movie</span>
+            )}
+            {!playableSrc && (
+              <div className="absolute bottom-4 left-1/2 -translate-x-1/2 px-3 py-1.5 bg-black/80 border border-white/10 rounded-full text-white font-bold" style={{ fontSize: 'var(--fs-micro)' }}>
+                {!currentVideo ? 'ช็อตนี้ยังไม่มีวิดีโอ — แสดงภาพนิ่งแทน' : cached === 'failed' ? 'โหลดวิดีโอจากคลัง Flow ไม่ได้ — ไปช็อตอื่นแล้วกลับมาเพื่อลองใหม่' : 'กำลังโหลดวิดีโอจากคลัง Flow...'}
+              </div>
+            )}
+            <div className="absolute top-4 left-4 px-2 py-1 bg-black/70 rounded font-mono text-white font-black" style={{ fontSize: 'var(--fs-micro)' }}>ช็อต {current.shotNumber}/{shots.length}</div>
+          </div>
+          <div className="flex items-center justify-center gap-3 py-3 border-t border-[var(--ui-border)]">
+            <button onClick={() => setMuted(!muted)} className="w-9 h-9 rounded-lg text-[var(--ui-text-muted)] hover:text-[var(--ui-text-primary)] flex items-center justify-center"><span className="material-symbols-outlined">{muted ? 'volume_off' : 'volume_up'}</span></button>
+            <span className="font-mono font-bold text-[var(--ui-text-muted)]" style={{ fontSize: 'var(--fs-micro)' }}>{fmt(playedSec)}</span>
+            <button onClick={() => goTo(index - 1)} disabled={index === 0} className="w-9 h-9 rounded-lg text-[var(--ui-text-primary)] disabled:opacity-20 flex items-center justify-center"><span className="material-symbols-outlined">skip_previous</span></button>
+            <button onClick={() => setPlaying(!playing)} className="w-12 h-12 rounded-full bg-[var(--ui-primary)] text-white flex items-center justify-center shadow-lg"><span className="material-symbols-outlined text-3xl font-bold">{playing ? 'pause' : 'play_arrow'}</span></button>
+            <button onClick={() => goTo(index + 1)} disabled={index >= shots.length - 1} className="w-9 h-9 rounded-lg text-[var(--ui-text-primary)] disabled:opacity-20 flex items-center justify-center"><span className="material-symbols-outlined">skip_next</span></button>
+            <span className="font-mono font-bold text-[var(--ui-text-muted)]" style={{ fontSize: 'var(--fs-micro)' }}>{fmt(totalDur)}</span>
+            <button onClick={() => setLoopAll(!loopAll)} title="เล่นวนทั้งเรื่อง" className={`w-9 h-9 rounded-lg flex items-center justify-center ${loopAll ? 'text-[var(--ui-primary)]' : 'text-[var(--ui-text-muted)]'}`}><span className="material-symbols-outlined">repeat</span></button>
+          </div>
+          <div className="px-4 pb-4">
+            <div className="relative h-14 bg-[var(--ui-input)] border border-[var(--ui-border)] rounded-xl overflow-hidden flex">
+              {shots.map((s, i) => {
+                const v = videoOf(s.id);
+                return (
+                  <button key={s.id} onClick={() => goTo(i)} style={{ width: `${(durOf(s) / totalDur) * 100}%` }} className={`relative h-full border-r border-black/30 overflow-hidden ${i === index ? 'ring-2 ring-inset ring-[var(--ui-primary)]' : ''} ${v ? '' : 'opacity-40'}`}>
+                    {frameOf(s) ? <img src={`data:image/png;base64,${frameOf(s)}`} className="w-full h-full object-cover" /> : <div className="w-full h-full bg-[var(--ui-surface-soft)]" />}
+                    <span className="absolute top-0.5 left-1 text-white font-black drop-shadow" style={{ fontSize: '9px' }}>{s.shotNumber}</span>
+                  </button>
+                );
+              })}
+              <div className="absolute top-0 bottom-0 w-0.5 bg-[var(--ui-accent)] pointer-events-none" style={{ left: `${(playedSec / totalDur) * 100}%` }} />
+            </div>
+          </div>
+        </div>
+        <div className="bg-[var(--ui-surface)] border border-[var(--ui-border)] rounded-2xl p-5 space-y-4 shadow-xl">
+          <div className="flex items-center gap-2">
+            <span className="font-mono font-black text-[var(--ui-accent)]">#{String(current.shotNumber).padStart(2, '0')}</span>
+            <span className="font-bold text-[var(--ui-text-primary)]" style={{ fontSize: 'var(--fs-small)' }}>{current.cameraAngle}</span>
+            <span className="ml-auto font-bold text-[var(--ui-text-muted)]" style={{ fontSize: 'var(--fs-micro)' }}>{durOf(current)}s</span>
+          </div>
+          <p className="text-[var(--ui-text-secondary)] leading-relaxed" style={{ fontSize: 'var(--fs-small)' }}>{current.description}</p>
+          {current.dialogue && (
+            <p className="text-[var(--ui-success)] font-bold italic" style={{ fontSize: 'var(--fs-small)' }}>{speaker ? `${speaker.name}: ` : ''}"{current.dialogue}"</p>
+          )}
+          <div className="flex flex-col gap-2 pt-1">
+            <button onClick={() => downloadOne(current)} disabled={!currentVideo} className="w-full py-3 bg-[var(--ui-surface-soft)] border border-[var(--ui-border)] text-[var(--ui-text-primary)] font-bold rounded-xl flex items-center justify-center gap-2 disabled:opacity-30" style={{ fontSize: 'var(--fs-small)' }}>
+              <span className="material-symbols-outlined text-lg">download</span>ดาวน์โหลดคลิปนี้
+            </button>
+            {onNavigate && (
+              <button onClick={() => onNavigate(5)} className="w-full py-3 bg-[var(--ui-surface-soft)] border border-[var(--ui-border)] text-[var(--ui-text-primary)] font-bold rounded-xl flex items-center justify-center gap-2" style={{ fontSize: 'var(--fs-small)' }}>
+                <span className="material-symbols-outlined text-lg">edit</span>ไปแก้ช็อตนี้
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+      <ConfirmDialog
+        open={showResetConfirm}
+        icon="warning"
+        tone="warning"
+        title="เริ่มโปรเจกต์ใหม่"
+        message="จะลบบท ตัวละคร ช็อต และวิดีโอทั้งหมด — แนะนำบันทึก ZIP ไว้ก่อน"
+        confirmLabel={bundling ? (bundleProgress || 'กำลังบันทึก...') : 'บันทึก ZIP ก่อนแล้วล้าง'}
+        busy={bundling}
+        onConfirm={handleSaveAndReset}
+        extraActions={[{ label: 'ล้างเลย ไม่บันทึก', tone: 'danger', onClick: onReset }]}
+        onCancel={() => setShowResetConfirm(false)}
+      />
+    </div>
+  );
+};

@@ -1,0 +1,334 @@
+import { NextStepButton } from './NextStepButton';
+import { resolveSpokenLanguage } from '../lib/language';
+import { getCameraMoveText, getCameraFrameText, angleLabel, moveLabel } from '../lib/cameraPresets';
+import { friendlyError } from '../lib/friendlyError';
+import { ConfirmDialog } from './ConfirmDialog';
+import { isVideoValid, videoStaleReason, resolveMedia } from '../lib/download';
+import { videoContentKey, shotFrameStaleReason } from '../lib/staleness';
+import { Pager } from './Pager';
+import { castCode, buildVideoLockBlock } from '../lib/castPrompt';
+import { beatTimes, fmtBeat } from '../lib/clipTiming';
+const ITEMS_PER_PAGE = 30;
+interface Props {
+  state: AppState;
+  onUpdate: (patch: Partial<AppState> | ((prev: AppState) => Partial<AppState>)) => void;
+  onNext: () => void;
+}
+export const Step5Video: React.FC<Props> = ({ state, onUpdate, onNext }) => {
+  const { addJobs, queue } = useQueue();
+  const [confirmBatch, setConfirmBatch] = useState(false);
+  const [replaceShot, setReplaceShot] = useState<Shot | null>(null);
+  const [vidLoad, setVidLoad] = useState<Record<string, 'loading' | 'failed'>>({});
+  
+  const [page, setPage] = useState(1);
+  const gridTopRef = useRef<HTMLDivElement>(null);
+  const goToPage = (p: number) => {
+    setPage(p);
+    gridTopRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+  useEffect(() => {
+    const pages = Math.max(1, Math.ceil(state.storyboard.length / ITEMS_PER_PAGE));
+    if (page > pages) setPage(pages);
+  }, [state.storyboard.length]);
+  const pagedShots = useMemo(
+    () => state.storyboard.slice((page - 1) * ITEMS_PER_PAGE, page * ITEMS_PER_PAGE),
+    [state.storyboard, page]
+  );
+  const loadVideo = async (v: VideoItem) => {
+    if (!v.videoMediaId || vidLoad[v.id] === 'loading') return;
+    setVidLoad(p => ({ ...p, [v.id]: 'loading' }));
+    const r = await resolveMedia(v.videoMediaId);
+    if (r) {
+      onUpdate(prev => ({ videos: (prev.videos || []).map(x => x.id === v.id ? { ...x, videoBase64: r.base64, mimeType: r.mimeType } : x) }));
+      setVidLoad(p => { const n = { ...p }; delete n[v.id]; return n; });
+    } else {
+      setVidLoad(p => ({ ...p, [v.id]: 'failed' }));
+    }
+  };
+  const getValidVideo = (shot: Shot) => {
+    const v = state.videos.find(x => x.shotId === shot.id && (!!x.videoBase64 || !!x.videoMediaId));
+    if (!v) return undefined;
+    return isVideoValid(v, state.storyboard) ? v : undefined;
+  };
+  const isVideoStale = (shot: Shot) => {
+    const v = state.videos.find(x => x.shotId === shot.id);
+    return !!v && videoStaleReason(v, shot) !== null;
+  };
+  const frameOld = (shot: Shot) => shotFrameStaleReason(shot, state.assets, state.config) !== null;
+  const queueVideoJobs = async (shot: Shot) => {
+    if (!shot.firstFrameMediaId && !shot.firstFrameBase64) return;
+    
+    const isRatioMismatch = shot.frameAspectRatio && shot.frameAspectRatio !== state.config.aspectRatio;
+    if (isRatioMismatch) {
+      alert(`ภาพช็อตเป็น ${shot.frameAspectRatio} แต่ตั้งไว้ ${state.config.aspectRatio} — สร้างภาพช็อตใหม่ใน STEP 4 ก่อน`);
+      return;
+    }
+    const videoModel = shot.videoModel || state.config.videoModel;
+    const dur = Number(shot.duration) || state.config.videoDuration;
+    if (!getVideoModelDurations(videoModel).includes(dur)) {
+      alert(`ช็อต ${shot.shotNumber}: ${videoModel} ทำคลิป ${dur} วิไม่ได้ — เปลี่ยนความยาวหรือโมเดลที่ STEP 4`);
+      return;
+    }
+    // Ensure valid Media ID
+    let validMediaId = shot.firstFrameMediaId;
+    if (!validMediaId && shot.firstFrameBase64) {
+      try {
+        const detectedMimeType = shot.firstFrameBase64.startsWith('/9j/') ? 'image/jpeg' : 'image/png';
+        const uploaded = await Flow.upload({
+          base64: shot.firstFrameBase64,
+          mimeType: detectedMimeType,
+          name: `shot_${shot.shotNumber}_first_frame`
+        });
+        validMediaId = uploaded.mediaId;
+        onUpdate(prev => ({
+          storyboard: (prev.storyboard || []).map(s => s.id === shot.id ? { ...s, firstFrameMediaId: validMediaId } : s)
+        }));
+      } catch (e) {
+        alert('อัปโหลดภาพคีย์เฟรมขึ้นเซิร์ฟเวอร์ไม่สำเร็จ ไม่สามารถสร้างวิดีโอได้');
+        return;
+      }
+    }
+    const spoken = resolveSpokenLanguage(state.script);
+    const listed = state.assets.filter(a => a.type === 'Character' && shot.characterIds?.includes(a.id));
+    let inFrame = shot.offScreenSpeaker ? listed.filter(a => a.id !== shot.speakerId) : listed;
+    const sp = state.assets.find(a => a.id === shot.speakerId && a.type === 'Character');
+    if (sp && !shot.offScreenSpeaker && shot.shotKind === 'dialogue' && !inFrame.some(a => a.id === sp.id)) inFrame = [sp, ...inFrame];
+    const shotLocation = state.assets.find(a => a.id === shot.locationId && a.type === 'Location');
+    
+    const toneString = state.config.colorTone === 'Custom' ? (state.config.customColorTone || '') : TONES_PROMPT[state.config.colorTone] || state.config.colorTone;
+    const colorGradePart = toneString ? ` Color grade: ${toneString}.` : '';
+    const styleString = ((state.config.style === 'Custom' ? state.config.customStyle : STYLES_PROMPT[state.config.style]) || '') + colorGradePart;
+    
+    let speakerName = 'The character';
+    let cleanDialogueText = (shot.dialogue || '').trim();
+    const dialogueMatch = cleanDialogueText.match(/^([^:：\n]+)[:：]\s*(.*)$/);
+    if (dialogueMatch) {
+      const prefix = dialogueMatch[1].trim();
+      const content = dialogueMatch[2].trim();
+      const isNameInAssets = state.assets.some(a => a.name.toLowerCase() === prefix.toLowerCase() || a.aliases?.split(',').some(alias => alias.trim().toLowerCase() === prefix.toLowerCase()));
+      if (prefix.length <= 20 && isNameInAssets) {
+        cleanDialogueText = content.replace(/^["']/, '').replace(/["']$/, '').trim();
+        if (!shot.speakerId) speakerName = prefix;
+      } else {
+        cleanDialogueText = cleanDialogueText.replace(/^["']/, '').replace(/["']$/, '').trim();
+      }
+    } else {
+      cleanDialogueText = cleanDialogueText.replace(/^["']/, '').replace(/["']$/, '').trim();
+    }
+    if (shot.speakerId) {
+      const asset = state.assets.find(a => a.id === shot.speakerId);
+      if (asset) {
+        speakerName = `${castCode(asset)} ${asset.name}`;
+      }
+    }
+    const dialogueLang = shot.dialogueLanguage || spoken.en;
+    const speakerAsset = state.assets.find(a => a.id === shot.speakerId);
+    const moveText = getCameraMoveText(shot);
+    const angleText = getCameraFrameText(shot);
+    const projectNotesStr = state.config.projectNotes ? ` Notes: ${state.config.projectNotes}.` : '';
+    // ===== พรอมป์วิดีโอตามคู่มือ Veo 3.1: แบ่งช่วงวินาที [00:00-00:02] แต่ละช่วง = กล้อง + ตัวละคร + การกระทำ (+ บทพูด เสียง) แล้วตามด้วยฉาก สไตล์ และล็อกหน้า =====
+    const NL = String.fromCharCode(10);
+    const tagA = (a: any) => `${castCode(a)} ${a.name}`;
+    const trimDot = (t?: string) => { const x = (t || '').trim(); return x.endsWith('.') ? x.slice(0, -1) : x; };
+    const lowerFirst = (t: string) => t ? t.charAt(0).toLowerCase() + t.slice(1) : t;
+    const namesIn = (t: string) => state.assets.reduce((acc, a) => acc.includes(castCode(a)) ? acc : acc.split(a.id.replace('@', '')).join(tagA(a)), (t || '').split('@').join(''));
+    const findChar = (n: string) => state.assets.find(x => x.type === 'Character' && (x.name === n || x.aliases?.split(',').some(y => y.trim() === n)));
+    const splitSay = (line: string) => {
+      const cut = [line.indexOf(':'), line.indexOf('：')].filter(x => x > 0 && x <= 20).sort((x, y) => x - y)[0];
+      return cut ? { name: line.slice(0, cut).trim(), text: line.slice(cut + 1).trim() } : { name: '', text: line.trim() };
+    };
+    const margin = state.config.cutMargin === 0 || state.config.cutMargin === 2 ? state.config.cutMargin : 1;
+    // ช็อตเก่าที่ยังไม่มีช่วงวินาที: ระบบทำช่วงให้เองจากมุมกล้อง คำบรรยาย และบทพูด
+    const target = speakerAsset && inFrame.some(a => a.id === speakerAsset.id) ? speakerAsset : inFrame[0];
+    const other = inFrame.find(a => a.id !== target?.id);
+    const named = (t: string) => target ? t.split('the subject').join(tagA(target)) : t;
+    const openCam = shot.angleId === 'over_shoulder' && target && other
+      ? `Over-the-shoulder shot from behind ${tagA(other)}, looking at ${tagA(target)} who faces the camera`
+      : named(trimDot(angleText || 'Medium shot'));
+    const rowsAll = (shot.dialogue || '').split(NL).map(r => r.trim()).filter(Boolean);
+    const convoRows = rowsAll.length > 1 && rowsAll.every(r => !!splitSay(r).name);
+    const rowList = convoRows ? rowsAll : (cleanDialogueText ? [cleanDialogueText] : []);
+    const fromAI = !!shot.beats?.length;
+    const beatList: ShotBeat[] = fromAI ? (shot.beats as ShotBeat[]) : [
+      { cam: `${openCam}${moveText ? `, ${lowerFirst(named(trimDot(moveText)))}` : ''}`, act: shot.description },
+      ...rowList.map((r, i) => {
+        const nm = splitSay(r).name;
+        const cut = convoRows && i > 0 && splitSay(rowList[i - 1]).name !== nm;
+        const a = nm ? findChar(nm) : undefined;
+        return { cam: cut ? `Medium shot of ${a ? tagA(a) : nm}` : 'Same shot', say: r };
+      })
+    ];
+    const sayText = (b: ShotBeat) => {
+      if (!b.say) return '';
+      const w = splitSay(b.say);
+      const a = w.name ? findChar(w.name) : speakerAsset;
+      const who = a ? tagA(a) : (w.name || speakerName);
+      const txt = w.text.replace(/^["'“]+|["'”]+$/g, '').trim();
+      const tone = b.tone ? `, ${trimDot(b.tone)}` : '';
+      return shot.offScreenSpeaker && a && a.id === shot.speakerId
+        ? ` The off-screen voice of ${who}, who is not visible, says in ${dialogueLang}${tone}: "${txt}". Nobody in the frame moves their lips.`
+        : ` ${who} says in ${dialogueLang}${tone}: "${txt}".`;
+    };
+    const segText = (b: ShotBeat) => `${fromAI ? namesIn(trimDot(b.cam)) : trimDot(b.cam)}.${b.act ? ` ${fromAI ? namesIn(trimDot(b.act)) : trimDot(b.act)}.` : ''}${sayText(b)}${b.sfx ? ` SFX: ${trimDot(b.sfx)}.` : ''}`;
+    const bt = beatTimes(beatList, dur, margin);
+    const segs: string[] = [];
+    if (bt.head) segs.push(`${fmtBeat(bt.head)} The camera holds on the opening frame, no one speaks.`);
+    beatList.forEach((b, i) => segs.push(`${bt.spans[i] ? `${fmtBeat(bt.spans[i])} ` : ''}${segText(b)}`));
+    if (bt.tail) segs.push(`${fmtBeat(bt.tail)} Same shot, a short quiet beat, no one speaks.`);
+    const hasCuts = beatList.some((b, i) => i > 0 && !b.cam.trim().toLowerCase().startsWith('same shot'));
+    const speakers = Array.from(new Set(beatList.filter(b => b.say).map(b => { const nm = splitSay(b.say || '').name; return nm ? findChar(nm) : speakerAsset; }).filter(Boolean))) as any[];
+    const voices = speakers.filter(a => a.voiceProfile?.trim()).map(a => `${tagA(a)}'s voice: ${a.voiceProfile.trim()}.`).join(' ');
+    const talk = beatList.some(b => b.say)
+      ? `Only these lines are spoken, in ${dialogueLang}. Each line is spoken only by the named character, and only that character's lips move during it.${voices ? ` ${voices} Keep each voice the same in every clip.` : ''}`
+      : 'No dialogue, nobody speaks.';
+    const contextPart = `Context: ${shotLocation ? tagA(shotLocation) : 'the place of this scene'}. Ambient noise: the natural background sound of this place. No background music.`;
+    const lockBlock = `${buildVideoLockBlock(inFrame, shotLocation, state.config)} Codes in square brackets are labels only; never speak them or show them as text.`;
+    let basePrompt = [segs.join(NL), `${talk}${hasCuts ? '' : ' One continuous shot, no cuts.'}`, contextPart, `Style: ${styleString}`, `${lockBlock}${hasCuts ? ' Every shot of this clip shows the same people with the same faces, hair and outfits.' : ''}${projectNotesStr}`].join(NL);
+    const suffix = ", clean frame, no on-screen text, no watermark";
+    const finalPrompt = basePrompt.toLowerCase().includes(suffix.toLowerCase()) ? basePrompt : `${basePrompt}${suffix}`;
+    addJobs([{ 
+      id: `vid_${shot.id}_${Date.now()}`, 
+      type: 'video', 
+      label: `วิดีโอช็อต ${shot.shotNumber}`, 
+      modelName: videoModel, 
+      credits: getVideoCreditCost(videoModel), 
+      status: 'waiting', 
+      progress: 0, 
+      retryCount: 0, 
+      payload: { prompt: finalPrompt, firstFrameImageMediaId: validMediaId, modelDisplayName: videoModel, aspectRatio: state.config.aspectRatio, durationSeconds: dur } 
+    }]);
+    onUpdate(prev => ({ 
+      storyboard: (prev.storyboard || []).map(s => s.id === shot.id 
+        ? { ...s, videoError: undefined, pendingVideoKey: videoContentKey(shot) } 
+        : s) 
+    }));
+    setReplaceShot(null);
+  };
+  const batchInfo = useMemo(() => {
+    const activeVideoJobIds = new Set(queue.jobs.filter(j => j.type === 'video' && ['waiting', 'starting', 'running'].includes(j.status)).map(j => j.id.split('_')[1]));
+    const shotsToAnimate = state.storyboard.filter(s => { 
+      const hasImg = !!s.firstFrameMediaId || !!s.firstFrameBase64; 
+      const noVid = !getValidVideo(s); 
+      const ratioMatches = !s.frameAspectRatio || s.frameAspectRatio === state.config.aspectRatio; 
+      const notInQueue = !activeVideoJobIds.has(s.id); 
+      const durOk = getVideoModelDurations(s.videoModel || state.config.videoModel).includes(Number(s.duration) || state.config.videoDuration);
+      return hasImg && noVid && ratioMatches && notInQueue && durOk && !frameOld(s); 
+    });
+    const skipGeneratingCount = state.storyboard.filter(s => { const hasImg = !!s.firstFrameMediaId || !!s.firstFrameBase64; const noVid = !getValidVideo(s); const ratioMatches = !s.frameAspectRatio || s.frameAspectRatio === state.config.aspectRatio; return hasImg && noVid && ratioMatches && activeVideoJobIds.has(s.id); }).length;
+    const skippedByRatioCount = state.storyboard.filter(s => s.frameAspectRatio && s.frameAspectRatio !== state.config.aspectRatio && (!!s.firstFrameMediaId || !!s.firstFrameBase64)).length;
+    const skippedNoImgCount = state.storyboard.filter(s => !s.firstFrameMediaId && !s.firstFrameBase64).length;
+    const skippedByDurationCount = state.storyboard.filter(s => (!!s.firstFrameMediaId || !!s.firstFrameBase64) && !getValidVideo(s) && !getVideoModelDurations(s.videoModel || state.config.videoModel).includes(Number(s.duration) || state.config.videoDuration)).length;
+    const skippedByOldFrameCount = state.storyboard.filter(s => (!!s.firstFrameMediaId || !!s.firstFrameBase64) && !getValidVideo(s) && frameOld(s)).length;
+    return { shots: shotsToAnimate, totalCredits: shotsToAnimate.reduce((t, s) => t + getVideoCreditCost(s.videoModel || state.config.videoModel), 0), skippedByRatioCount, skippedNoImgCount, skipGeneratingCount, skippedByDurationCount, skippedByOldFrameCount };
+  }, [state.storyboard, state.videos, state.assets, state.config, queue.jobs]);
+  const handleBatchAnimate = () => { batchInfo.shots.forEach(queueVideoJobs); setConfirmBatch(false); };
+  const successfulShotsCount = useMemo(() => state.storyboard.filter(s => !!getValidVideo(s)).length, [state.storyboard, state.videos]);
+  const missingRequirements = useMemo(() => { const reqs = []; if (successfulShotsCount === 0) reqs.push("กรุณาสร้างแอนิเมชัน"); else if (successfulShotsCount < state.storyboard.length) reqs.push("กรุณาสร้างแอนิเมชันให้ครบทุกช็อต"); return reqs; }, [successfulShotsCount, state.storyboard.length]);
+  const spoken = resolveSpokenLanguage(state.script);
+  return (
+    <div className="flex flex-col gap-7 pb-24">
+      <header className="flex flex-col md:flex-row justify-between items-center bg-[var(--ui-surface)] p-5 md:p-6 rounded-2xl border border-[var(--ui-border)] shadow-xl gap-4">
+        <div className="flex flex-col flex-1"><div className="flex items-center gap-3"><p style={{ fontSize: 'var(--fs-micro)' }} className="text-[var(--ui-text-muted)] font-bold uppercase tracking-widest">วิดีโอทั้งหมด</p><div className="flex gap-2"><div className="bg-[var(--ui-primary)]/10 border border-[var(--ui-primary)]/30 rounded-full px-3 py-0.5 flex items-center gap-1.5 animate-in fade-in"><span className="material-symbols-outlined text-[10px] text-[var(--ui-primary)] font-bold">aspect_ratio</span><span className="text-[9px] font-black uppercase text-[var(--ui-primary)] tracking-tight">สัดส่วน {state.config.aspectRatio} · เปลี่ยนได้ที่ STEP 2</span></div><div className="bg-[var(--ui-primary)]/10 border border-[var(--ui-primary)]/30 rounded-full px-3 py-0.5 flex items-center gap-1.5 animate-in fade-in"><span className="material-symbols-outlined text-[10px] text-[var(--ui-primary)] font-bold">lock</span><span className="text-[9px] font-black uppercase text-[var(--ui-primary)] tracking-tight">ล็อกหน้า+ฉาก · ชุด: {state.config.wardrobeMode === 'free' ? 'เปลี่ยนได้' : 'ล็อก'}</span></div></div></div><div className="flex flex-wrap items-center gap-2 mt-1"><span className={`text-[var(--fs-small)] font-black text-[var(--ui-text-primary)]`}>พร้อมสร้าง {batchInfo.shots.length} ช็อต · สำเร็จ {successfulShotsCount} / {state.storyboard.length}</span></div></div>
+        <div className="flex gap-3"><button onClick={() => setConfirmBatch(true)} disabled={batchInfo.shots.length === 0} className="g2-cta px-8 py-4 rounded-xl font-extrabold flex items-center justify-center gap-2 shadow-xl disabled:opacity-30 transition-all"><span className="material-symbols-outlined font-bold text-xl">movie_filter</span>สร้างวิดีโอทุกช็อต</button></div>
+      </header>
+      <ConfirmDialog
+        open={confirmBatch}
+        icon="movie_filter"
+        tone="warning"
+        title="สร้างวิดีโอทุกช็อต"
+        message={<>จะสร้างวิดีโอ <span className="text-[var(--ui-accent)] font-extrabold">{batchInfo.shots.length} ช็อต</span></>}
+        confirmLabel="เริ่มสร้าง"
+        confirmDisabled={batchInfo.shots.length === 0}
+        onConfirm={handleBatchAnimate}
+        onCancel={() => setConfirmBatch(false)}
+      >
+        <div className="space-y-2 text-left" style={{ fontSize: 'var(--fs-small)' }}>
+          {batchInfo.skipGeneratingCount > 0 && <p className="font-bold text-[var(--ui-accent)]">ข้าม {batchInfo.skipGeneratingCount} ช็อตที่กำลังสร้างอยู่</p>}
+          {batchInfo.skippedByRatioCount > 0 && <p className="font-bold text-[var(--ui-danger)]">ข้าม {batchInfo.skippedByRatioCount} ช็อตที่สัดส่วนภาพไม่ตรง — สร้างภาพใหม่ใน STEP 4 ก่อน</p>}
+          {batchInfo.skippedNoImgCount > 0 && <p className="font-bold text-[var(--ui-text-muted)]">ข้าม {batchInfo.skippedNoImgCount} ช็อตที่ยังไม่มีภาพ</p>}
+          {batchInfo.skippedByDurationCount > 0 && <p className="font-bold text-[var(--ui-danger)]">ข้าม {batchInfo.skippedByDurationCount} ช็อตที่ความยาวคลิปใช้กับโมเดลไม่ได้ — แก้ที่ STEP 4</p>}
+          {batchInfo.skippedByOldFrameCount > 0 && <p className="font-bold text-[var(--ui-danger)]">ข้าม {batchInfo.skippedByOldFrameCount} ช็อตที่ภาพช็อตยังเก่า — สร้างภาพใหม่ใน STEP 4 ก่อน</p>}
+          <p className="font-black text-[var(--ui-text-primary)] text-center pt-1" style={{ fontSize: 'var(--fs-body)' }}>{batchInfo.totalCredits === 0 ? 'ไม่ใช้เครดิต (ฟรี)' : `ใช้ทั้งหมด ${batchInfo.totalCredits} เครดิต`}</p>
+        </div>
+      </ConfirmDialog>
+      <ConfirmDialog
+        open={!!replaceShot}
+        icon="replay"
+        tone="warning"
+        title="สร้างวิดีโอใหม่"
+        message={<>วิดีโอเดิมของช็อตที่ {replaceShot?.shotNumber} จะถูกแทนที่ · {getVideoCreditCost(replaceShot?.videoModel || state.config.videoModel) === 0 ? 'ไม่ใช้เครดิต (ฟรี)' : `ใช้ ${getVideoCreditCost(replaceShot?.videoModel || state.config.videoModel)} เครดิต`}</>}
+        confirmLabel="สร้างใหม่"
+        onConfirm={() => { if (replaceShot) queueVideoJobs(replaceShot); }}
+        onCancel={() => setReplaceShot(null)}
+      />
+      {state.storyboard.length > ITEMS_PER_PAGE && (
+        <div ref={gridTopRef} className="scroll-mt-16">
+          <Pager page={page} total={state.storyboard.length} perPage={ITEMS_PER_PAGE} onChange={goToPage} />
+        </div>
+      )}
+      <div className="grid gap-4 pb-12" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(var(--ui-card-min, 200px), 1fr))' }}>
+        {pagedShots.map((shot) => {
+          const video = state.videos.find(v => v.shotId === shot.id); 
+          const validVideo = getValidVideo(shot);
+          const stale = isVideoStale(shot);
+          const activeJob = queue.jobs.find(j => j.id.includes(shot.id) && j.type === 'video' && (j.status === 'waiting' || j.status === 'starting' || j.status === 'running')); 
+          const hasError = shot.videoError; 
+          const noImage = !shot.firstFrameMediaId && !shot.firstFrameBase64; 
+          const isRatioMismatch = shot.frameAspectRatio && shot.frameAspectRatio !== state.config.aspectRatio; 
+          const isVidRatioMismatch = video?.aspectRatio && video.aspectRatio !== state.config.aspectRatio; 
+          const angleTh = shot.angleId === 'custom' ? (shot.angleCustom || 'กำหนดเอง') : angleLabel(shot.angleId);
+          const moveTh = shot.moveId === 'custom' ? (shot.moveCustom || 'กำหนดเอง') : moveLabel(shot.moveId);
+          
+          const reason = video ? videoStaleReason(video, shot) : null;
+          const staleLabel = reason === 'frame' ? "วิดีโอเก่า — ภาพช็อตเปลี่ยน" : 
+                            reason === 'duration' ? "วิดีโอเก่า — ความยาวเปลี่ยน" : 
+                            reason === 'content' ? "วิดีโอเก่า — บทพูด/กล้องเปลี่ยน" : "วิดีโอเก่า";
+          return (
+            <div key={shot.id} className="bg-[var(--ui-surface)] border border-[var(--ui-border)] rounded-2xl overflow-hidden flex flex-col relative shadow-lg transition-all hover:border-[var(--ui-border-strong)]">
+              <div className={`w-full ${state.config.aspectRatio === '9:16' ? 'aspect-[9/16]' : 'aspect-video'} bg-black relative overflow-hidden flex items-center justify-center`}>
+                {activeJob ? <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center z-30 backdrop-blur-md"><div className="w-10 h-10 border-[3px] border-amber-500 border-t-transparent rounded-full animate-spin mb-4" /><span style={{ fontSize: '10px' }} className="text-amber-500 font-bold uppercase tracking-[0.2em] animate-pulse">กำลังสร้างวิดีโอ...</span>{video && video.videoBase64 && <video src={`data:${video.mimeType};base64,${video.videoBase64}`} className="absolute inset-0 w-full h-full object-contain opacity-20 pointer-events-none" />}</div> : hasError ? <div className="absolute inset-0 bg-red-950/40 flex flex-col items-center justify-center z-20 p-6 text-center"><span className="material-symbols-outlined text-red-500 text-4xl mb-2">error</span><span className="text-red-400 font-black text-xs uppercase tracking-widest mb-1">สร้างไม่สำเร็จ</span><p className="text-red-300 text-[11px] font-bold line-clamp-2 mb-4" title={hasError}>{friendlyError(hasError)}</p><button onClick={() => queueVideoJobs(shot)} className="px-6 py-2 bg-red-500 text-white rounded-lg font-black text-[10px] uppercase tracking-widest hover:bg-red-600 transition-colors">ลองใหม่</button></div> : noImage ? <div className="absolute inset-0 bg-slate-900/60 flex flex-col items-center justify-center z-10 text-center p-6"><span className="material-symbols-outlined text-slate-500 text-4xl mb-2">image_not_supported</span><span className="text-slate-400 font-black text-xs uppercase tracking-widest">ยังไม่มีภาพช็อต — กลับไป STEP 4</span></div> : video ? (video.videoBase64 ? <video src={`data:${video.mimeType};base64,${video.videoBase64}`} className="w-full h-full object-contain" controls /> : (
+                  <div className="w-full h-full flex flex-col items-center justify-center bg-slate-800 text-center p-6 gap-2">
+                    <span className="material-symbols-outlined text-amber-500 text-4xl">cloud_done</span>
+                    <p className="text-xs text-white font-bold leading-tight">วิดีโออยู่ในคลัง Flow</p>
+                    {vidLoad[video.id] === 'loading'
+                      ? <div className="w-6 h-6 border-2 border-amber-500 border-t-transparent rounded-full animate-spin" />
+                      : <button onClick={() => loadVideo(video)} className="px-4 py-2 bg-[var(--ui-accent)] hover:bg-[var(--ui-accent-hover)] text-black rounded-lg font-black text-[10px]">{vidLoad[video.id] === 'failed' ? 'โหลดไม่ได้ — ลองใหม่' : 'โหลดวิดีโอ'}</button>}
+                  </div>
+                )) : <div className="w-full h-full flex flex-col items-center justify-center text-white opacity-20 gap-2"><span className="material-symbols-outlined text-5xl">movie</span><span style={{ fontSize: '9px' }} className="font-black uppercase tracking-widest">พร้อมสร้าง</span></div>}
+                {isRatioMismatch && !activeJob && <div className="absolute top-14 left-4 bg-amber-500 text-black px-2 py-1 rounded-[6px] font-black text-[9px] uppercase shadow-lg z-40 animate-in fade-in">ภาพช็อตเป็น {shot.frameAspectRatio} แต่ตั้งไว้ {state.config.aspectRatio} — สร้างภาพช็อตใหม่ใน STEP 4 ก่อน</div>}
+                {frameOld(shot) && !activeJob && <div className="absolute top-4 right-4 bg-amber-500 text-black px-2 py-1 rounded-[6px] font-black text-[9px] uppercase shadow-lg z-40">ภาพช็อตยังเก่า — สร้างใหม่ใน STEP 4</div>}
+                {isVidRatioMismatch && !activeJob && <div className="absolute bottom-4 left-4 bg-amber-500 text-black px-2 py-1 rounded-[6px] font-black text-[9px] uppercase shadow-lg z-40">วิดีโอเป็น {video?.aspectRatio} ไม่ตรงกับ {state.config.aspectRatio} — กดสร้างใหม่</div>}
+                <div className="absolute top-4 left-4 bg-black/60 px-2.5 py-1 rounded-lg font-mono text-white text-[11px] font-black z-40">#{shot.shotNumber}</div>
+              </div>
+              <div className="p-4 space-y-3">
+                <div className="flex justify-between items-start">
+                  <span className="text-[var(--ui-accent)] font-extrabold uppercase tracking-tight block truncate" style={{ fontSize: '10px' }}>{shot.videoModel || state.config.videoModel} · {shot.duration}S</span>
+                  {validVideo ? (
+                    <span className="bg-emerald-500/10 text-emerald-500 text-[9px] font-black px-2 py-0.5 rounded border border-emerald-500/20">สำเร็จ</span>
+                  ) : (stale && !activeJob) ? (
+                    <span className="bg-amber-500/10 text-amber-500 text-[9px] font-black px-2 py-0.5 rounded border border-amber-500/20">
+                      {staleLabel}
+                    </span>
+                  ) : null}
+                </div>
+                <div className="bg-[var(--ui-accent)]/10 border border-[var(--ui-accent)]/20 rounded-lg px-2 py-1 flex items-center gap-1.5 self-start"><span className="material-symbols-outlined text-[12px] text-[var(--ui-accent)]">videocam</span><span className="text-[10px] font-bold text-[var(--ui-accent)] tracking-thai-tight">{shot.beats?.length ? `ช่วงวินาที ${shot.beats.length} ช่วง — แก้ได้ที่ STEP 4` : `${angleTh} · ${moveTh}`}</span></div>
+                <p style={{ fontSize: 'var(--fs-small)' }} className="text-[var(--ui-text-secondary)] font-medium leading-snug line-clamp-3" title={shot.description}>"{shot.description}"</p>
+                {shot.dialogue && (
+                  <div className="p-3 bg-[var(--ui-input)] rounded-xl border border-[var(--ui-border)] shadow-inner">
+                    <p style={{ fontSize: '11px' }} className="text-[var(--ui-text-muted)] font-bold tracking-thai-tight">
+                      {shot.offScreenSpeaker ? "เสียงนอกจอ · " : `พูด (${spoken.th}): `}
+                      <span className="text-[var(--ui-text-primary)] whitespace-pre-line">"{shot.dialogue}"</span>
+                    </p>
+                  </div>
+                )}
+                <button onClick={() => { if (video) setReplaceShot(shot); else queueVideoJobs(shot); }} disabled={!!activeJob || noImage || isRatioMismatch} className={`w-full py-2.5 rounded-lg font-bold transition-all border shadow-sm flex items-center justify-center gap-2 ${(noImage || isRatioMismatch) ? 'bg-[var(--ui-surface-soft)] text-[var(--ui-text-muted)] border-[var(--ui-border)] opacity-50' : 'bg-[var(--ui-surface-soft)] text-[var(--ui-text-primary)] border-[var(--ui-border)] hover:bg-[var(--ui-primary)]/10'}`}><span className="material-symbols-outlined text-lg">{video ? 'replay' : 'play_arrow'}</span>{video ? 'สร้างวิดีโอใหม่' : 'สร้างวิดีโอ'}</button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <Pager page={page} total={state.storyboard.length} perPage={ITEMS_PER_PAGE} onChange={goToPage} />
+      <div className="fixed bottom-0 left-0 lg:left-[280px] right-0 bg-[var(--ui-bg)]/90 backdrop-blur-2xl border-t border-[var(--ui-border)] p-6 flex justify-between items-center z-40"><div className="flex flex-col"><span style={{ fontSize: 'var(--fs-micro)' }} className="text-[var(--ui-text-muted)] font-extrabold uppercase tracking-widest">ความสำเร็จ</span><span style={{ fontSize: 'var(--fs-small)' }} className="text-[var(--ui-text-primary)] font-bold tracking-tight">เสร็จสิ้น {successfulShotsCount} <span className="text-[var(--ui-text-muted)]">/</span> {state.storyboard.length} ช็อต</span></div><NextStepButton onNext={onNext} missingRequirements={missingRequirements} className="px-12 py-3.5 bg-[var(--ui-accent)] text-black font-extrabold rounded-full shadow-2xl uppercase tracking-widest" /></div>
+    </div>
+  );
+};

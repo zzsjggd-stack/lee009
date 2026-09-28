@@ -1,0 +1,12 @@
+export const STEP_LIST = [
+  { id: 1, th: 'เตรียมบท', en: 'SCRIPT' },
+  { id: 2, th: 'สไตล์ภาพ', en: 'STYLE' },
+  { id: 3, th: 'ตัวละครและฉาก', en: 'ASSETS' },
+  { id: 4, th: 'สตอรี่บอร์ด', en: 'STORYBOARD' },
+  { id: 5, th: 'สร้างวิดีโอ', en: 'VIDEO' },
+  { id: 6, th: 'ตัวอย่างวิดีโอ', en: 'PREVIEW' },
+];
+export const stepLabel = (id: number) => {
+  const s = STEP_LIST.find(x => x.id === id);
+  return s ? `${s.th} (${s.en})` : '';
+};

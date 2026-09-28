@@ -1,0 +1,85 @@
+  { id: 'medium', th: 'ครึ่งตัว', frame: 'Medium shot, waist up, the subject centered' },
+  { id: 'close', th: 'ใกล้หน้า', frame: 'Close-up, head and shoulders, the face fills most of the frame' },
+  { id: 'over_shoulder', th: 'ข้ามไหล่', frame: 'Over-the-shoulder shot from behind one character, looking at the other' },
+  { id: 'full_body', th: 'เต็มตัว', frame: 'Full shot, the whole body head to toe inside the frame' },
+  { id: 'wide_estab', th: 'ภาพกว้างบอกสถานที่', frame: 'Wide establishing shot, the location and the subject inside it' },
+  { id: 'two_shot', th: 'สองคนในเฟรม', frame: 'Two shot, both characters in the same frame at the same distance' },
+  { id: 'extreme_close', th: 'โคลสอัพสุด', frame: 'Extreme close-up on the key detail only: eyes, hands or the object' },
+  { id: 'low_angle', th: 'มุมต่ำเงยขึ้น', frame: 'Low angle looking up at the subject, the subject towering over the camera' },
+  { id: 'high_angle', th: 'มุมสูงมองลง', frame: 'High angle looking down at the subject, the subject small below the camera' },
+  { id: 'pov', th: 'มุมมองบุคคลที่หนึ่ง', frame: 'First person point of view, what the character sees through their own eyes' },
+  { id: 'extreme_wide', th: 'กว้างสุดตา / มุมนกบิน', frame: 'Extreme wide aerial view, the subject tiny in a vast landscape' },
+  { id: 'dutch', th: 'เอียงกล้อง', frame: 'Dutch angle, the horizon tilted, unsettling framing' },
+  { id: 'custom', th: 'กำหนดเอง', frame: '' },
+];
+export const CAMERA_MOVES: CameraMove[] = [
+  { id: 'static', th: 'กล้องนิ่ง', move: 'Static locked-off camera, the camera does not move' },
+  { id: 'push_in', th: 'ดันเข้าช้าๆ', move: 'Slow smooth dolly push-in toward the subject' },
+  { id: 'pull_out', th: 'ถอยเผยฉาก', move: 'Slow smooth dolly pull-back, revealing more of the surroundings' },
+  { id: 'pan', th: 'แพนซ้ายขวา', move: 'Slow smooth horizontal pan' },
+  { id: 'tilt', th: 'ก้ม / เงย', move: 'Slow vertical tilt, the camera tips up or down' },
+  { id: 'handheld', th: 'กล้องถือมือ', move: 'Handheld camera with subtle natural shake' },
+  { id: 'orbit', th: 'หมุนรอบตัว', move: 'The camera orbits smoothly around the subject, keeping them centered' },
+  { id: 'follow', th: 'เดินตามตัวละคร', move: 'Smooth gimbal shot following the subject as they move' },
+  { id: 'drone', th: 'โดรนบินสูง', move: 'Drone camera drifting high above the scene' },
+  { id: 'crash_zoom', th: 'ซูมพุ่งเข้าหน้า (เสี่ยง)', move: 'Sudden fast crash zoom into the subject', risky: true },
+  { id: 'dolly_zoom', th: 'ดันเข้าซูมออก เวียนหัว (เสี่ยง)', move: 'Dolly zoom, the camera pushes in while the lens zooms out, the background warps', risky: true },
+  { id: 'whip_pan', th: 'สะบัดกล้อง (เสี่ยง)', move: 'Fast whip pan, motion blur across the frame', risky: true },
+  { id: 'custom', th: 'กำหนดเอง', move: '' },
+];
+// มุมกล้องเริ่มต้นตามชนิดช็อต เมื่อ AI ไม่ได้ระบุ
+export const DEFAULT_ANGLE_BY_KIND: Record<string, string> = {
+  dialogue: 'medium',
+  reaction: 'close',
+  action: 'full_body',
+  atmosphere: 'wide_estab',
+};
+export const DEFAULT_MOVE_BY_KIND: Record<string, string> = {
+  dialogue: 'static',
+  reaction: 'push_in',
+  action: 'handheld',
+  atmosphere: 'push_in',
+};
+// แปลงท่ากล้องแบบเก่า 16 แบบ เป็นมุม + การเคลื่อนไหว
+export const LEGACY_PRESET_MAP: Record<string, { angleId?: string; moveId: string }> = {
+  static: { moveId: 'static' },
+  push_in: { moveId: 'push_in' },
+  pull_out: { moveId: 'pull_out' },
+  pan: { moveId: 'pan' },
+  handheld: { moveId: 'handheld' },
+  over_shoulder: { angleId: 'over_shoulder', moveId: 'static' },
+  low_hero: { angleId: 'low_angle', moveId: 'push_in' },
+  aerial_focus: { angleId: 'high_angle', moveId: 'pull_out' },
+  sky_trail: { angleId: 'wide_estab', moveId: 'drone' },
+  wide_scape: { angleId: 'extreme_wide', moveId: 'pan' },
+  top_glide: { angleId: 'high_angle', moveId: 'drone' },
+  zoom_burst: { angleId: 'medium', moveId: 'crash_zoom' },
+  bird_frame: { angleId: 'extreme_wide', moveId: 'drone' },
+  spin_view: { angleId: 'medium', moveId: 'orbit' },
+  path_follow: { angleId: 'full_body', moveId: 'follow' },
+  sky_vista: { angleId: 'over_shoulder', moveId: 'pull_out' },
+};
+export const angleLabel = (id?: string) => CAMERA_ANGLES.find(a => a.id === id)?.th || 'เลือกมุมกล้อง';
+export const moveLabel = (id?: string) => CAMERA_MOVES.find(m => m.id === id)?.th || 'เลือกการเคลื่อนไหว';
+/** ข้อความมุมกล้องสำหรับภาพนิ่ง STEP 4 */
+export function getCameraFrameText(shot: Shot): string | undefined {
+  const s: any = shot;
+  if (s.angleId === 'custom') return s.angleCustom || undefined;
+  if (s.angleId) return CAMERA_ANGLES.find(a => a.id === s.angleId)?.frame;
+  const legacy = s.cameraPreset ? LEGACY_PRESET_MAP[s.cameraPreset] : undefined;
+  if (legacy?.angleId) return CAMERA_ANGLES.find(a => a.id === legacy.angleId)?.frame;
+  if (s.cameraPreset === 'custom') return s.cameraCustom || undefined;
+  return undefined;
+}
+/** ข้อความการเคลื่อนไหวสำหรับวิดีโอ STEP 5 */
+export function getCameraMoveText(shot: Shot): string | undefined {
+  const s: any = shot;
+  if (s.moveId === 'custom') return s.moveCustom || undefined;
+  if (s.moveId) return CAMERA_MOVES.find(m => m.id === s.moveId)?.move;
+  const legacy = s.cameraPreset ? LEGACY_PRESET_MAP[s.cameraPreset] : undefined;
+  if (legacy) return CAMERA_MOVES.find(m => m.id === legacy.moveId)?.move;
+  if (s.cameraPreset === 'custom') return s.cameraCustom || undefined;
+  return undefined;
+}
+/** ของเก่า เก็บไว้ไม่ให้โค้ดส่วนที่ยังไม่ได้แก้พัง */
+export const CAMERA_PRESETS = CAMERA_MOVES.map(m => ({ id: m.id, th: m.th, group: m.risky ? 'ท่าเสี่ยง' : 'การเคลื่อนไหว', move: m.move }));
