@@ -1,0 +1,73 @@
+/**
+ * UI Preferences Logic for G2
+ * Handles persistence and canonical defaults for visual workspace settings.
+ */
+export type TextSize = 'small' | 'medium' | 'large';
+export type UIDensity = 'compact' | 'standard' | 'comfortable';
+export type UITheme = 'light' | 'dark'; // Removed 'prakai'
+export type CardSize = 'S' | 'M' | 'L';
+export const CARD_MIN_WIDTH: Record<CardSize, number> = { S: 160, M: 200, L: 240 };
+export interface UIPreferences {
+  textSize: TextSize;
+  density: UIDensity;
+  theme: UITheme;
+  cardSize: CardSize;
+}
+export const UI_STORAGE_KEY = 'g2_ui_preferences_v2';
+export const DEFAULT_UI_PREFERENCES: UIPreferences = {
+  textSize: 'medium',
+  density: 'standard',
+  theme: 'dark',
+  cardSize: 'S',
+};
+/**
+ * Loads preferences from localStorage with fallback to defaults.
+ */
+export function loadUIPreferences(): UIPreferences {
+  try {
+    const saved = localStorage.getItem(UI_STORAGE_KEY);
+    if (!saved) return DEFAULT_UI_PREFERENCES;
+    
+    const parsed = JSON.parse(saved);
+    
+    // Handle fallback for removed 'prakai' theme
+    let themeValue: UITheme = (parsed.theme === 'light' || parsed.theme === 'dark') 
+      ? parsed.theme 
+      : DEFAULT_UI_PREFERENCES.theme;
+      
+    if (parsed.theme === 'prakai') {
+      themeValue = 'dark';
+    }
+    return {
+      ...DEFAULT_UI_PREFERENCES,
+      ...parsed,
+      textSize: parsed.textSize || DEFAULT_UI_PREFERENCES.textSize,
+      density: parsed.density || DEFAULT_UI_PREFERENCES.density,
+      cardSize: (parsed.cardSize === 'S' || parsed.cardSize === 'M' || parsed.cardSize === 'L') ? parsed.cardSize : DEFAULT_UI_PREFERENCES.cardSize,
+      theme: themeValue
+    };
+  } catch (error) {
+    console.warn('Unable to load UI preferences, using defaults.', error);
+    return DEFAULT_UI_PREFERENCES;
+  }
+}
+/**
+ * Persists preferences to localStorage.
+ */
+export function saveUIPreferences(prefs: UIPreferences): void {
+  try {
+    localStorage.setItem(UI_STORAGE_KEY, JSON.stringify(prefs));
+  } catch (error) {
+    console.warn('Unable to save UI preferences to localStorage', error);
+  }
+}
+/**
+ * Clears stored preferences.
+ */
+export function resetUIPreferences(): void {
+  try {
+    localStorage.removeItem(UI_STORAGE_KEY);
+  } catch (error) {
+    console.warn('Unable to clear UI preferences', error);
+  }
+}

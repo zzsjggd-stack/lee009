@@ -1,0 +1,60 @@
+import React from 'react';
+interface Props {
+  page: number;
+  total: number;
+  perPage: number;
+  onChange: (p: number) => void;
+}
+export const Pager: React.FC<Props> = ({ page, total, perPage, onChange }) => {
+  const pages = Math.max(1, Math.ceil(total / perPage));
+  if (pages <= 1) return null;
+  const btn = 'w-9 h-9 rounded-lg border border-[var(--ui-border)] bg-[var(--ui-surface-soft)] text-[var(--ui-text-primary)] flex items-center justify-center disabled:opacity-30 transition-all hover:border-[var(--ui-border-hover)] active:scale-95';
+  return (
+    <div className="flex items-center justify-center gap-2 py-2 animate-in fade-in duration-300">
+      <button 
+        onClick={() => onChange(1)} 
+        disabled={page <= 1} 
+        className={btn}
+        title="หน้าแรก"
+      >
+        <span className="material-symbols-outlined text-lg">first_page</span>
+      </button>
+      <button 
+        onClick={() => onChange(page - 1)} 
+        disabled={page <= 1} 
+        className={btn}
+        title="ก่อนหน้า"
+      >
+        <span className="material-symbols-outlined text-lg">chevron_left</span>
+      </button>
+      
+      <select 
+        value={page} 
+        onChange={e => onChange(Number(e.target.value))} 
+        className="h-9 bg-[var(--ui-input)] border border-[var(--ui-border)] rounded-lg px-2 text-xs font-bold text-[var(--ui-text-primary)] outline-none focus:border-[var(--ui-accent)] cursor-pointer"
+      >
+        {Array.from({ length: pages }, (_, i) => (
+          <option key={i + 1} value={i + 1}>ช็อต {i * perPage + 1}–{Math.min(total, (i + 1) * perPage)}</option>
+        ))}
+      </select>
+      <button 
+        onClick={() => onChange(page + 1)} 
+        disabled={page >= pages} 
+        className={btn}
+        title="ถัดไป"
+      >
+        <span className="material-symbols-outlined text-lg">chevron_right</span>
+      </button>
+      <button 
+        onClick={() => onChange(pages)} 
+        disabled={page >= pages} 
+        className={btn}
+        title="หน้าสุดท้าย"
+      >
+        <span className="material-symbols-outlined text-lg">last_page</span>
+      </button>
+      
+      <span className="text-[11px] font-bold text-[var(--ui-text-muted)] ml-1 uppercase tracking-tight">หน้า {page}/{pages}</span>
+    </div>
+  );
+};

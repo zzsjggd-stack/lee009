@@ -1,0 +1,239 @@
+export interface AppState {
+  script: ScriptData;
+  config: ConfigData;
+  assets: Asset[];
+  storyboard: Shot[];
+  videos: VideoItem[];
+  downloadedMediaIds?: string[];
+  splitFailures?: { chunk: number; preview: string; text?: string; target?: number; afterShotId?: string }[];
+}
+export interface ScriptHistoryItem {
+  id: string;
+  timestamp: number;
+  content: string;
+  sceneCount: number;
+}
+export interface ScriptData {
+  original: string;
+  processed: string;
+  history?: ScriptHistoryItem[];
+  genre: string;
+  customGenre?: string;
+  customGenreThai?: string;
+  customPacing?: number;
+  durationSeconds: number;
+  durationRaw: string;
+  language: string; // This is the "Prompt Language"
+  spokenLanguage: string;
+  customSpokenLanguage?: string;
+  customSpokenLanguageEn?: string;
+  sceneCeiling: 'auto' | 35 | 65 | 80;
+  setting: string;
+  customSetting?: string;
+  customSettingThai?: string;
+  extraNotes?: string;
+  scriptMode?: 'ai' | 'user';
+}
+export interface ConfigData {
+  aspectRatio: '16:9' | '9:16' | '1:1' | '4:5';
+  colorTone: string;
+  customColorTone?: string;
+  customColorToneThai?: string;
+  negativePrompt: string;
+  projectNotes: string;
+  style: string;
+  customStyle?: string;
+  customStyleThai?: string;
+  maxScenes: number;
+  imageModel: string;
+  videoModel: string;
+  textModel: 'high' | 'medium' | 'low';
+  isTestMode: boolean;
+  videoDuration: number;
+  batchCount: number;
+  maxConcurrentJobs: number;
+  staggerDelaySeconds: number;
+  shotPacing?: 'economy' | 'balanced' | 'max' | 'detailed';
+  durationMode?: 'auto' | 'fixed';
+  wardrobeMode?: 'locked' | 'free';
+  limitThreeCast?: boolean;
+  cutMargin?: 0 | 1 | 2; // เผื่อไว้ตัดต่อ (วินาทีต่อคลิป) ค่าเริ่มต้น 1
+}
+export type AssetType = 'Character' | 'Location' | 'Prop';
+export type AssetStatus = 'NO IMAGE' | 'GENERATING' | 'READY' | 'LOCKED' | 'FAILED';
+export type AssetGenMode = 'Single' | 'Reference Sheet';
+export interface AssetMetadata {
+  // Common
+  role?: string;
+  evidence?: string;
+  appearsInScenes?: string;
+  
+  // Continuity Locks
+  identityLock?: string;
+  spatialLock?: string;
+  visualLock?: string;
+  // Character specific
+  age?: string;
+  gender?: string;
+  appearance?: string;
+  hair?: string;
+  body?: string;
+  wardrobe?: string;
+  accessories?: string;
+  personality?: string;
+  mood?: string;
+  // Location specific
+  locationType?: string;
+  architecture?: string;
+  timeOfDay?: string;
+  weather?: string;
+  lighting?: string;
+  importantObjects?: string;
+  countryCulture?: string;
+  era?: string;
+  layout?: string;
+  materials?: string;
+  environment?: string;
+  // Prop specific
+  category?: string;
+  material?: string;
+  shape?: string;
+  color?: string;
+  size?: string;
+  function?: string;
+  distinctiveDetails?: string;
+}
+export interface Asset {
+  id: string;
+  type: AssetType;
+  name: string;
+  aliases?: string;
+  voiceProfile?: string;
+  voiceProfileThai?: string;
+  description: string;
+  extraDetails?: string;
+  metadata: AssetMetadata;
+  visualPrompt: string;
+  visualPromptThai?: string;
+  imageVisualPrompt?: string; // Prompt used to generate current image
+  imageKey?: string;
+  pendingImageKey?: string;
+  nameEditedByUser?: boolean;
+  promptEditedByUser?: boolean;
+  negativePrompt?: string;
+  status: AssetStatus;
+  isLocked: boolean;
+  isNameSuspicious?: boolean;
+  missingFromScript?: boolean;
+  addedInStep3?: boolean;
+  referenceMediaId?: string;
+  referenceBase64?: string;
+  referenceMimeType?: string;
+  sourceReferences?: Array<{ mediaId: string; base64: string }>;
+  generationOptions?: {
+    mode: AssetGenMode;
+    styleOverride?: string;
+    aspectRatio?: '1:1' | '4:5' | '16:9' | '9:16';
+    quality?: 'Draft' | 'Standard' | 'High';
+  };
+  generationError?: string;
+}
+export interface Shot {
+  id: string;
+  shotNumber: number;
+  cameraAngle: string;
+  description: string;
+  dialogue: string;
+  duration: number;
+  characterIds?: string[]; 
+  locationId?: string;
+  propIds?: string[];
+  wardrobeIds?: string[];
+  validationError?: string; 
+  firstFrameMediaId?: string;
+  firstFrameBase64?: string;
+  frameAspectRatio?: string; // Metadata for aspect ratio tracking
+  speakerId?: string;
+  shotKind?: 'dialogue' | 'action' | 'reaction' | 'atmosphere';
+  offScreenSpeaker?: boolean;
+  dialogueLanguage?: string;
+  dialogueThai?: string;
+  cameraPreset?: string;
+  cameraCustom?: string;
+  angleId?: string;
+  angleCustom?: string;
+  moveId?: string;
+  moveCustom?: string;
+  cameraChangedAfterImage?: boolean;
+  pendingFrameKey?: string;
+  frameSourceKey?: string;
+  frameRefIds?: string;
+  pendingRefIds?: string;
+  pendingVideoKey?: string;
+  frameError?: string;
+  videoError?: string;
+  videoModel?: string;
+  durationManual?: boolean;
+  positions?: string;
+  beats?: ShotBeat[]; // ช่วงวินาทีในคลิป (AI เขียนตอนแบ่งช็อต)
+}
+// 1 ช่วงในคลิป ตามคู่มือ Veo 3.1 (timestamp prompting) — เวลาของแต่ละช่วงคำนวณตอนสร้างวิดีโอ
+export interface ShotBeat {
+  cam: string;   // กล้อง: มุมภาพและคนที่กล้องจับ เช่น Medium shot of CH01
+  act?: string;  // ท่าทางและสีหน้าในช่วงนี้
+  say?: string;  // บทพูดในช่วงนี้ แบบ ชื่อ: บทพูด (ตรงตามบททุกคำ)
+  tone?: string; // น้ำเสียงและอารมณ์ของบทพูด
+  sfx?: string;  // เสียงเอฟเฟกต์ในช่วงนี้
+}
+export interface VideoItem {
+  id: string; 
+  shotId: string;
+  videoMediaId: string;
+  videoBase64: string;
+  mimeType: string;
+  aspectRatio?: string; // Metadata for aspect ratio tracking
+  sourceFrameMediaId?: string;
+  durationSeconds?: number;
+  sourceKey?: string;
+}
+export type JobType = 'image' | 'video';
+export interface Job {
+  id: string;
+  type: JobType;
+  label: string;
+  modelName: string;
+  payload: any;
+  status: 'waiting' | 'starting' | 'running' | 'completed' | 'failed';
+  progress: number;
+  retryCount: number;
+  credits: number;
+  error?: string;
+  startTime?: number;
+  rateLimitCount?: number;
+}
+export interface QueueState {
+  jobs: Job[];
+  isPaused: boolean;
+  totalCreditsSpent: number;
+}
+export type AssetAnalysisStatus =
+  | 'idle'
+  | 'preparing'
+  | 'reading'
+  | 'characters'
+  | 'locations'
+  | 'props'
+  | 'finalizing'
+  | 'completed'
+  | 'failed';
+export interface AssetAnalysisState {
+  status: AssetAnalysisStatus;
+  progress: number;
+  statusText: string;
+  error?: string;
+  summary?: {
+    characters: number;
+    locations: number;
+    props: number;
+  };
+}

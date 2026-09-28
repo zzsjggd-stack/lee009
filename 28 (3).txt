@@ -1,0 +1,199 @@
+import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { Flow } from 'flow-sdk';
+import { useQueue } from '../hooks/useQueue';
+import { useRunningSteps } from '../lib/backgroundTasks';
+import { STEP_LIST, stepLabel } from '../lib/steps';
+import { copyToClipboard } from '../lib/clipboard';
+interface SidebarProps {
+  currentStep: number;
+  onNavigate: (step: number) => void;
+  onExport: () => void;
+  onImport: (e: React.ChangeEvent<HTMLInputElement>) => void;
+  exportProgress?: string | null;
+}
+const G2Mark = ({ size }: { size: number }) => (
+  <svg width={size} height={size} viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <path d="M9 17H27V26A2 2 0 0 1 25 28H11A2 2 0 0 1 9 26Z" stroke="#FFFFFF" strokeWidth="2" strokeLinejoin="round" />
+    <path d="M16.2 20V25L20.6 22.5Z" fill="#FFFFFF" />
+    <rect x="9" y="13.5" width="18" height="3.5" stroke="#FFFFFF" strokeWidth="1.6" strokeLinejoin="round" />
+    <path d="M12.5 17L14.5 13.5M17 17L19 13.5M21.5 17L23.5 13.5" stroke="#FFFFFF" strokeWidth="1.6" strokeLinecap="round" />
+    <g transform="rotate(-16 9 13.5)">
+      <rect x="9" y="10" width="18" height="3.5" stroke="#FFFFFF" strokeWidth="1.6" strokeLinejoin="round" />
+      <path d="M12.5 13.5L14.5 10M17 13.5L19 10M21.5 13.5L23.5 10" stroke="#FFFFFF" strokeWidth="1.6" strokeLinecap="round" />
+    </g>
+  </svg>
+);
+export const Sidebar: React.FC<SidebarProps> = ({ currentStep, onNavigate, onExport, onImport, exportProgress }) => {
+  const [isCollapsed, setIsCollapsed] = useState(() => {
+    const saved = sessionStorage.getItem('g2_sidebar_collapsed');
+    return saved === 'true';
+  });
+  const [isAuthorCopied, setIsAuthorCopied] = useState(false);
+  const runningSteps = useRunningSteps();
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const { queue } = useQueue();
+  const queueSteps = useMemo(() => {
+    const s = new Set<number>();
+    queue.jobs.forEach(j => {
+      if (!['waiting', 'starting', 'running'].includes(j.status)) return;
+      if (j.id.startsWith('asset_')) s.add(3);
+      else if (j.id.startsWith('shot_')) s.add(4);
+      else if (j.id.startsWith('vid_')) s.add(5);
+    });
+    return s;
+  }, [queue.jobs]);
+  const AUTHOR_URL = 'https://sites.google.com/view/glee21?usp=sharing';
+  useEffect(() => {
+    sessionStorage.setItem('g2_sidebar_collapsed', isCollapsed.toString());
+  }, [isCollapsed]);
+  const handleAuthorClick = async () => {
+    try {
+      const flowAny = Flow as any;
+      if (typeof flowAny.openUrl === 'function') {
+        await flowAny.openUrl(AUTHOR_URL);
+        return;
+      }
+      if (typeof flowAny.navigation?.openExternal === 'function') {
+        await flowAny.navigation.openExternal(AUTHOR_URL);
+        return;
+      }
+      const w = window.open(AUTHOR_URL, '_blank');
+      if (w) {
+        w.opener = null;
+      } else {
+        throw new Error('BLOCKED');
+      }
+    } catch (err) {
+      const ok = await copyToClipboard(AUTHOR_URL);
+      if (ok) {
+        setIsAuthorCopied(true);
+        setTimeout(() => setIsAuthorCopied(false), 2500);
+      }
+    }
+  };
+  return (
+    <aside 
+      className={`bg-[var(--ui-sidebar)] border-r border-[var(--ui-border)] flex flex-col h-full shrink-0 relative transition-all duration-300 ease-in-out ${
+        isCollapsed ? 'w-[72px]' : 'w-[280px]'
+      }`}
+      style={{ zIndex: 20 }}
+    >
+      <div className={`p-6 border-b border-[var(--ui-border)] relative bg-[var(--ui-sidebar)] ${isCollapsed ? 'flex flex-col items-center gap-4' : ''}`}>
+        <div className={`flex items-center gap-3 ${isCollapsed ? 'justify-center' : 'justify-between'}`}>
+          <div className="flex items-center gap-2 overflow-hidden shrink-0">
+             <div className="rounded-xl flex items-center justify-center shrink-0 shadow-lg overflow-hidden" style={{ background: 'var(--ui-gradient)', width: isCollapsed ? 40 : 36, height: isCollapsed ? 40 : 36 }}>
+                <G2Mark size={isCollapsed ? 40 : 36} />
+             </div>
+             {!isCollapsed && (
+               <div className="flex flex-col overflow-hidden">
+                 <h1 className="font-extrabold text-[var(--ui-text-primary)] text-[18px] tracking-tight leading-tight whitespace-nowrap uppercase">G2</h1>
+                 <button 
+                  onClick={handleAuthorClick}
+                  title="เปิดเว็บไซต์ผู้เขียน"
+                  className="mt-1 flex items-center gap-1.5 group outline-none"
+                 >
+                   <div className="w-5 h-5 rounded-full border border-[var(--ui-accent)]/60 bg-[var(--ui-surface-soft)] flex items-center justify-center shrink-0">
+                      <span className="text-[var(--ui-accent)] text-[9px] font-black leading-none">GL</span>
+                   </div>
+                   <div className="flex items-center gap-1">
+                     <span className="text-[11px] font-bold text-[var(--ui-text-muted)]">ผู้เขียน:</span>
+                     <span className="text-[11px] font-bold text-[var(--ui-text-secondary)] group-hover:text-[var(--ui-text-primary)] transition-colors">
+                       {isAuthorCopied ? 'คัดลอกลิงก์แล้ว' : 'G Lee'}
+                     </span>
+                   </div>
+                   <span className="material-symbols-outlined text-[12px] text-[var(--ui-accent)]">open_in_new</span>
+                 </button>
+               </div>
+             )}
+          </div>
+          
+          {!isCollapsed && (
+            <button onClick={() => setIsCollapsed(true)} className="text-[var(--ui-text-muted)] hover:text-[var(--ui-text-primary)] transition-colors">
+              <span className="material-symbols-outlined text-lg">chevron_left</span>
+            </button>
+          )}
+        </div>
+        {isCollapsed && (
+          <button onClick={() => setIsCollapsed(false)} className="text-[var(--ui-text-muted)] hover:text-[var(--ui-text-primary)] transition-colors">
+            <span className="material-symbols-outlined text-lg">chevron_right</span>
+          </button>
+        )}
+      </div>
+      <nav className={`flex-1 overflow-y-auto overflow-x-hidden py-5 space-y-3 ${isCollapsed ? 'px-0' : 'px-4'}`}>
+        {STEP_LIST.map((step) => {
+          const isActive = currentStep === step.id;
+          const isDone = currentStep > step.id;
+          const isRunning = runningSteps.includes(step.id) || queueSteps.has(step.id);
+          return (
+            <button
+              key={step.id}
+              onClick={() => onNavigate(step.id)}
+              className={`w-full flex items-center relative transition-all group outline-none h-12 ${
+                isCollapsed ? 'justify-center' : 'px-4 gap-4'
+              } ${isActive ? 'opacity-100' : 'opacity-40 hover:opacity-100'}`}
+            >
+              {isActive && !isCollapsed && (
+                <div className="absolute left-0 top-1/2 -translate-y-1/2 w-1 h-7 rounded-r" style={{ background: 'var(--ui-gradient)' }} />
+              )}
+              
+              <div className={`absolute inset-0 pointer-events-none transition-colors ${isActive ? 'bg-[var(--ui-primary)]/10' : ''}`} />
+              <div className="relative shrink-0 flex items-center justify-center">
+                {isRunning && (
+                  <div className="absolute -inset-1.5 border-2 border-amber-500/20 border-t-amber-500 rounded-full animate-spin z-0" style={{ animationDuration: '1.2s' }} />
+                )}
+                <div 
+                  className={`w-9 h-9 rounded-full flex items-center justify-center text-[11px] font-bold shrink-0 transition-all border z-10 ${
+                    isActive 
+                      ? 'text-white border-transparent shadow-lg' 
+                      : isDone 
+                        ? 'bg-transparent border-[var(--ui-success)] text-[var(--ui-success)]' 
+                        : isRunning
+                          ? 'bg-amber-500/10 border-amber-500/50 text-amber-500'
+                          : 'bg-transparent border-[var(--ui-border-strong)] text-[var(--ui-text-muted)]'
+                  }`}
+                  style={isActive ? { background: 'var(--ui-gradient)' } : undefined}
+                >
+                  {isDone ? <span className="material-symbols-outlined text-base font-bold">check</span> : step.id}
+                </div>
+              </div>
+              {!isCollapsed && (
+                <div className="flex flex-col text-left overflow-hidden z-10">
+                  <span className="text-[9px] uppercase font-bold tracking-[0.15em] text-[var(--ui-text-muted)] leading-none mb-1">STEP {step.id}</span>
+                  <div className="flex items-center gap-1.5">
+                    <span className={`text-[13px] font-semibold tracking-normal whitespace-nowrap transition-colors ${isActive ? 'text-[var(--ui-text-primary)]' : 'text-[var(--ui-text-secondary)]'}`}>
+                      {stepLabel(step.id)}
+                    </span>
+                    {isRunning && <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse shrink-0" />}
+                  </div>
+                </div>
+              )}
+              {(isCollapsed || isRunning) && (
+                <div className="absolute left-full ml-4 px-3 py-2 bg-[var(--ui-surface-raised)] text-[var(--ui-text-primary)] text-[12px] font-bold rounded-lg border border-[var(--ui-border)] opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity whitespace-nowrap z-[100] shadow-2xl flex items-center gap-2">
+                  {isRunning ? 'กำลังทำงาน — เปลี่ยนหน้าได้' : stepLabel(step.id)}
+                </div>
+              )}
+            </button>
+          );
+        })}
+      </nav>
+      <div className={`p-4 border-t border-[var(--ui-border)] bg-[var(--ui-sidebar)] z-10 ${isCollapsed ? 'flex flex-col items-center gap-2' : 'grid grid-cols-2 gap-2'}`}>
+        <button 
+          onClick={onExport} 
+          disabled={!!exportProgress} 
+          title={exportProgress || 'บันทึกโปรเจกต์เป็นไฟล์ ZIP'} 
+          className={`flex items-center justify-center gap-2 py-3 bg-[var(--ui-surface-soft)] hover:bg-[var(--ui-surface-raised)] text-[var(--ui-text-primary)] rounded-xl border border-[var(--ui-border)] transition-all disabled:opacity-60 ${isCollapsed ? 'w-11 h-11' : 'px-2'}`}
+        >
+          {exportProgress
+            ? <span className="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin shrink-0" />
+            : <span className="material-symbols-outlined text-lg">save_as</span>}
+          {!isCollapsed && <span className="text-[11px] font-bold whitespace-nowrap truncate">{exportProgress || 'บันทึก'}</span>}
+        </button>
+        <button onClick={() => fileInputRef.current?.click()} title="เปิดโปรเจกต์จากไฟล์ ZIP" className={`flex items-center justify-center gap-2 py-3 bg-[var(--ui-success)]/10 hover:bg-[var(--ui-success)]/20 text-[var(--ui-success)] border border-[var(--ui-success)]/30 rounded-xl transition-all ${isCollapsed ? 'w-11 h-11' : 'px-2'}`}>
+          <span className="material-symbols-outlined text-lg font-bold">folder_open</span>
+          {!isCollapsed && <span className="text-[11px] font-bold whitespace-nowrap">เปิดไฟล์</span>}
+        </button>
+        <input ref={fileInputRef} type="file" accept=".zip,.json" className="hidden" onChange={onImport} />
+      </div>
+    </aside>
+  );
+};

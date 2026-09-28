@@ -1,0 +1,145 @@
+import { useSyncExternalStore } from 'react';
+/**
+ * โครงสร้างข้อมูลงานเบื้องหลัง
+ */
+export type BgTask = {
+  id: string;
+  step: number;
+  label: string;
+  progress: string;
+  status: 'running' | 'done' | 'error';
+  result?: any;
+  error?: string;
+};
+// เก็บสถานะงานไว้นอก React Component เพื่อให้ข้อมูลไม่หายเมื่อสลับหน้า
+const tasks = new Map<string, BgTask>();
+const listeners = new Set<() => void>();
+/**
+ * แจ้งเตือนผู้ติดตามทั้งหมดเมื่อมีการเปลี่ยนแปลงข้อมูล
+ */
+function emitChange() {
+  listeners.forEach(listener => listener());
+}
+/**
+ * เริ่มการทำงานเบื้องหลัง
+ * @param id ไอดีเฉพาะของงาน
+ * @param step ขั้นตอนของแอป (1-6)
+ * @param label ชื่อเรียกงานสำหรับแสดงผล
+ * @param runner ฟังก์ชันหลักที่ทำงาน AI
+ */
+export async function runTask(
+  id: string,
+  step: number,
+  label: string,
+  runner: (setProgress: (text: string) => void) => Promise<any>
+): Promise<any> {
+  // หากงานเดิมไอดีนี้กำลังรันอยู่ ให้คืนค่างานเดิม ไม่เริ่มใหม่
+  const existing = tasks.get(id);
+  if (existing && existing.status === 'running') {
+    return existing.result;
+  }
+  // เริ่มงานใหม่
+  const newTask: BgTask = {
+    id,
+    step,
+    label,
+    progress: 'กำลังเตรียมการ...',
+    status: 'running'
+  };
+  tasks.set(id, newTask);
+  emitChange();
+  try {
+    const setProgress = (text: string) => {
+      const current = tasks.get(id);
+      if (current) {
+        tasks.set(id, { ...current, progress: text });
+        emitChange();
+      }
+    };
+    const result = await runner(setProgress);
+    
+    tasks.set(id, {
+      ...tasks.get(id)!,
+      status: 'done',
+      progress: 'เสร็จสมบูรณ์',
+      result
+    });
+    emitChange();
+    return result;
+  } catch (err: any) {
+    // บันทึกความผิดพลาดลงในสถานะงานเพื่อให้ UI นำไปแสดงผล
+    const e: any = err;
+    let detail = '';
+    try { detail = JSON.stringify(e, Object.getOwnPropertyNames(e || {}).filter(k => k !== 'stack' && k !== 'message' && k !== 'name')); } catch {}
+    const head = [e?.name, e?.message, e?.code, e?.status].filter(Boolean).join(' | ');
+    const errorMsg = `${head || String(err)}${detail ? ' :: ' + detail : ''}`.slice(0, 400);
+    
+    tasks.set(id, {
+      ...tasks.get(id)!,
+      status: 'error',
+      progress: 'เกิดข้อผิดพลาด',
+      error: errorMsg
+    });
+    emitChange();
+    
+    // ไม่ throw err ต่อ เพื่อป้องกัน Unhandled Promise Rejection ใน background task
+    // UI จะตรวจสอบสถานะ 'error' จาก useBgTask แทน
+    console.error(`Background task [${id}] failed:`, errorMsg);
+  }
+}
+/**
+ * ดึงข้อมูลงานปัจจุบันตาม ID
+ */
+export function getTask(id: string): BgTask | undefined {
+  return tasks.get(id);
+}
+/**
+ * ล้างข้อมูลงานออกจากหน่วยความจำ
+ */
+export function clearTask(id: string) {
+  tasks.delete(id);
+  emitChange();
+}
+/**
+ * Hook สำหรับติดตามสถานะงานแบบ Real-time ใน React Component
+ */
+export function useBgTask(id: string): BgTask | undefined {
+  return useSyncExternalStore(
+    (callback) => {
+      listeners.add(callback);
+      return () => listeners.delete(callback);
+    },
+    () => tasks.get(id)
+  );
+}
+let lastSteps: number[] = [];
+/**
+ * Hook สำหรับดึงรายการขั้นตอน (Step) ที่มีงานกำลังทำงานอยู่
+ * มีการตรวจสอบความเท่ากันของข้อมูลเพื่อป้องกันการ Re-render ซ้ำซ้อน
+ */
+export function useRunningSteps(): number[] {
+  return useSyncExternalStore(
+    (callback) => {
+      listeners.add(callback);
+      return () => listeners.delete(callback);
+    },
+    () => {
+      const runningSteps = new Set<number>();
+      tasks.forEach(task => {
+        if (task.status === 'running') {
+          runningSteps.add(task.step);
+        }
+      });
+      const currentSteps = Array.from(runningSteps).sort((a, b) => a - b);
+      
+      // Simple shallow equality check to return stable reference
+      if (currentSteps.length === lastSteps.length && 
+          currentSteps.every((val, index) => val === lastSteps[index])) {
+        return lastSteps;
+      }
+      
+      lastSteps = currentSteps;
+      return currentSteps;
+    }
+  );
+}

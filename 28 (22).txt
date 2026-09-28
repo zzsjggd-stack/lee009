@@ -1,0 +1,46 @@
+/**
+ * Prompt Utilities for G2
+ * Handles filtering of negative prompts based on the selected art style.
+ */
+const FORBIDDEN_WORDS_MAP: Record<string, string[]> = {
+  '3D Render (Pixar Style)': ['no 3d render', 'no cartoon', 'no illustration'],
+  '3D Render (Unreal Engine)': ['no 3d render'],
+  'Anime': ['no anime', 'no cartoon', 'no illustration'],
+  'Sketch / Line Art': ['no sketch', 'no illustration', 'no cartoon'],
+  'Flat Illustration': ['no illustration', 'no cartoon', 'no flat lighting'],
+  'Watercolor': ['no painting', 'no illustration'],
+  'Comic Panel': ['no cartoon', 'no illustration', 'no anime'],
+  'Stop Motion': ['no cartoon', 'no 3d render'],
+  'Vintage Film': ['no low quality', 'no blurry'],
+  'Security Camera': ['no low quality', 'no blurry', 'no flat lighting'],
+};
+/**
+ * Returns a list of forbidden words in the negative prompt for a given style.
+ */
+export function getForbiddenWordsForStyle(style: string): string[] {
+  return FORBIDDEN_WORDS_MAP[style] || [];
+}
+/**
+ * Filters the negative prompt by removing words that conflict with the selected style.
+ * Case-insensitive comparison of comma-separated items.
+ */
+export function filterNegativePrompt(negativePrompt: string, style: string): string {
+  const forbidden = getForbiddenWordsForStyle(style);
+  if (forbidden.length === 0) return negativePrompt;
+  const items = negativePrompt.split(',').map(item => item.trim());
+  const filtered = items.filter(item => {
+    const lowerItem = item.toLowerCase();
+    return !forbidden.includes(lowerItem);
+  });
+  return filtered.join(', ');
+}
+/**
+ * Checks if a negative prompt contains any words that will be filtered out for a given style.
+ * Returns the list of words that would be removed.
+ */
+export function getConflictingWords(negativePrompt: string, style: string): string[] {
+  const forbidden = getForbiddenWordsForStyle(style);
+  if (forbidden.length === 0) return [];
+  const items = negativePrompt.split(',').map(item => item.trim().toLowerCase());
+  return forbidden.filter(word => items.includes(word));
+}

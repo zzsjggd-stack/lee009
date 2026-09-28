@@ -1,0 +1,928 @@
+import React, { useState, useMemo, useEffect, useRef } from 'react';
+import { Flow } from 'flow-sdk';
+import { AppState, ScriptData, ConfigData, ScriptHistoryItem } from '../types';
+import { copyToClipboard } from '../lib/clipboard';
+import { SHOT_PACING } from '../lib/constants';
+import { NextStepButton } from './NextStepButton';
+import { 
+  parseScriptFile, 
+  normalizeImportedText
+} from '../lib/scriptFileParser';
+import { resolveSpokenLanguage, resolveScriptLanguage } from '../lib/language';
+import { resolveStoryWorld, StoryWorld } from '../lib/storyWorld';
+import { runTask, useBgTask, clearTask } from '../lib/backgroundTasks';
+import { parseAssetLines } from '../lib/assetLineParser';
+import { pullAssetItems } from '../lib/assetPuller';
+import { ConfirmDialog } from './ConfirmDialog';
+import { friendlyError } from '../lib/friendlyError';
+import { ErrorDetails } from './ErrorDetails';
+interface Props {
+  state: AppState;
+  onUpdate: (data: ScriptData) => void;
+  onConfigUpdate: (config: ConfigData) => void;
+  onNext: () => void;
+}
+const SETTINGS = [
+  'ไทยร่วมสมัย',
+  'ไทยย้อนยุค',
+  'จีนย้อนยุค',
+  'จีนร่วมสมัย',
+  'เกาหลีร่วมสมัย',
+  'ญี่ปุ่นร่วมสมัย',
+  'ญี่ปุ่นย้อนยุค',
+  'ตะวันตกร่วมสมัย',
+  'ตะวันตกย้อนยุค',
+  'กำหนดเอง'
+];
+const GENRE_GROUPS: Record<string, string[]> = {
+  "หนังและละคร": [
+    "ละครสั้นแนวตั้ง (พลิกกลับ)",
+    "ย้อนยุคจีน",
+    "ดราม่าชีวิต",
+    "รักโรแมนติก",
+    "ตลก",
+    "สยองขวัญ",
+    "ระทึกขวัญ",
+    "แอ็กชัน"
+  ],
+  "คลิปสั้นไวรัล": [
+    "เอาตัวรอด",
+    "สะใจทันควัน",
+    "ปริศนาหักมุม",
+    "ตลกสเก็ตช์",
+    "สัตว์เลี้ยง"
+  ],
+  "โฆษณา": [
+    "โฆษณาสินค้า 15 วินาที",
+    "โฆษณาสินค้า 30 วินาที",
+    "หนังแบรนด์"
+  ],
+  "คอนเทนต์ความรู้": [
+    "สารคดีเล่าความรู้",
+    "ประวัติศาสตร์",
+    "สอนทีละขั้นตอน"
+  ],
+  "อื่นๆ": [
+    "มิวสิกวิดีโอ",
+    "วิชวลลูป",
+    "วิดีโอองค์กร"
+  ],
+  "กำหนดเอง": [
+    "กำหนดเอง"
+  ]
+};
+const SCENE_LENGTH_SECONDS: Record<string, number> = {
+  "หนังและละคร": 20,
+  "คลิปสั้นไวรัล": 15,
+  "โฆษณา": 10,
+  "คอนเทนต์ความรู้": 30,
+  "อื่นๆ": 20,
+  "กำหนดเอง": 20
+};
+const SPOKEN_LANGUAGES = [
+  'อัตโนมัติตามโลกของเรื่อง',
+  'ไทยกลาง (มาตรฐาน)',
+  'ไทยใต้ (สำเนียงใต้)',
+  'ไทยคำเมือง (เหนือ)',
+  'ไทยอีสาน',
+  'หลายภาษา (Multilingual)',
+  'กำหนดเอง (Custom)'
+];
+const SCENE_CEILING_OPTIONS = [
+  { label: 'อัตโนมัติ (ตามความยาวเฉลี่ย)', value: 'auto' },
+  { label: 'ไม่เกิน 35 ฉาก', value: 35 },
+  { label: 'ไม่เกิน 65 ฉาก', value: 65 },
+  { label: 'ไม่เกิน 80 ฉาก', value: 80 },
+];
+const TEXT_MODELS = [
+  { label: 'Gemini Thinking', value: 'high' },
+  { label: 'Gemini Pro', value: 'medium' },
+  { label: 'Gemini Flash', value: 'low' },
+];
+const MAX_SCRIPT_CHARS = 30000;
+const GENERATION_TIMEOUT_MS = 180000; // 3 minutes
+const CustomSettingsInput: React.FC<{
+  value: string;
+  onChange: (v: string) => void;
+  placeholder: string;
+  onBlur?: () => void;
+}> = ({ value, onChange, placeholder, onBlur }) => {
+  const [isFocused, setIsFocused] = useState(false);
+  const ref = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    if (ref.current) {
+      if (isFocused) {
+        ref.current.style.height = 'auto';
+        ref.current.style.height = Math.min(ref.current.scrollHeight, 120) + 'px';
+      } else {
+        ref.current.style.height = '40px';
+      }
+    }
+  }, [value, isFocused]);
+  return (
+    <textarea
+      ref={ref}
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      onFocus={() => setIsFocused(true)}
+      onBlur={() => { setIsFocused(false); onBlur?.(); }}
+      placeholder={placeholder}
+      className="w-full bg-[var(--ui-input)] border border-[var(--ui-border)] rounded-lg px-3 py-2 text-xs outline-none focus:border-[var(--ui-accent)] transition-all resize-none mt-1.5 font-medium placeholder:text-[var(--ui-text-muted)]"
+      style={{ height: '40px', maxHeight: '120px' }}
+    />
+  );
+};
+export const Step1Script: React.FC<Props> = ({ state, onUpdate, onConfigUpdate, onNext }) => {
+  // Background Task Hooks
+  const taskScript = useBgTask('step1-script');
+  const taskAssets = useBgTask('step1-assets');
+  
+  const [elapsed, setElapsed] = useState(0);
+  const [inputFeedback, setInputFeedback] = useState<{ type: 'success' | 'info' | 'error'; message: string; details?: string } | null>(null);
+  const [extractionAlert, setExtractionAlert] = useState<{ message: string; details: string } | null>(null);
+  const [activeTab, setActiveTab] = useState<'script' | 'assets'>('script');
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+  const [showOverwriteConfirm, setShowOverwriteConfirm] = useState(false);
+  const [hasJustImported, setHasJustImported] = useState(false);
+  const [isDragging, setIsDragging] = useState(false);
+  const [stopping, setStopping] = useState(false);
+  
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const abortRef = useRef(false);
+  const timerRef = useRef<number | null>(null);
+  const loading = (taskScript?.status === 'running') || (taskAssets?.status === 'running');
+  const activeTask = taskScript?.status === 'running' ? taskScript : (taskAssets?.status === 'running' ? taskAssets : null);
+  const { 
+    original, 
+    processed, 
+    history = [], 
+    genre, 
+    customGenre, 
+    durationSeconds, 
+    durationRaw, 
+    language, 
+    sceneCeiling, 
+    setting, 
+    customSetting, 
+    customSettingThai,
+    spokenLanguage, 
+    customSpokenLanguage, 
+    extraNotes,
+    scriptMode = 'ai'
+  } = state.script;
+  // Local timer sync
+  useEffect(() => {
+    if (loading) {
+      if (!timerRef.current) {
+        timerRef.current = window.setInterval(() => {
+          setElapsed(prev => prev + 1);
+        }, 1000);
+      }
+    } else {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+      setElapsed(0);
+    }
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+    };
+  }, [loading]);
+  // Sync results when tasks finish to update feedbacks/alerts
+  useEffect(() => {
+    if (taskScript?.status === 'done' && taskScript.result) {
+      const res = taskScript.result;
+      if (res.feedback) setInputFeedback(res.feedback);
+      if (res.alert) setExtractionAlert(res.alert);
+      setStopping(false);
+      clearTask('step1-script');
+    }
+    if (taskScript?.status === 'error') {
+      if (String(taskScript.error || '').includes('CANCELLED')) {
+        setInputFeedback({ type: 'info', message: 'ยกเลิกแล้ว — บทเดิมยังอยู่' });
+      } else {
+        setInputFeedback({ type: 'error', message: 'สร้างไม่สำเร็จ ขั้น 1/2 — บทเดิมยังอยู่', details: taskScript.error });
+      }
+      setStopping(false);
+      clearTask('step1-script');
+    }
+    if (taskAssets?.status === 'done' && taskAssets.result) {
+      const res = taskAssets.result;
+      if (res.feedback) setInputFeedback(res.feedback);
+      if (res.alert) setExtractionAlert(res.alert);
+      setStopping(false);
+      clearTask('step1-assets');
+    }
+    if (taskAssets?.status === 'error') {
+      if (String(taskAssets.error || '').includes('CANCELLED')) {
+        setInputFeedback({ type: 'info', message: 'ยกเลิกแล้ว — บทเดิมยังอยู่' });
+      } else {
+        setInputFeedback({ type: 'error', message: 'ดึงองค์ประกอบไม่สำเร็จ', details: taskAssets.error });
+      }
+      setStopping(false);
+      clearTask('step1-assets');
+    }
+  }, [taskScript, taskAssets]);
+  const sceneCount = useMemo(() => {
+    return (processed.match(/^\s*\[?\s*SCENE\s+\d+/gim) || []).length;
+  }, [processed]);
+  const extractScreenplayOnly = (text: string) => {
+    if (!text) return "";
+    return text.replace(/\[ASSET DEFINITIONS\][\s\S]*?\[END ASSET DEFINITIONS\]/i, "").trim();
+  };
+  const extractAssetDefinitions = (text: string) => {
+    const match = text.match(/\[ASSET DEFINITIONS\]([\s\S]*?)\[END ASSET DEFINITIONS\]/i);
+    return match ? match[1].trim() : "";
+  };
+  const parseAssetTable = (assetText: string) => {
+    const sections: Record<string, string[][]> = { CHARACTERS: [], LOCATIONS: [], PROPS: [] };
+    let currentSection = "";
+    
+    const lines = assetText.split('\n');
+    lines.forEach(line => {
+      const trimmed = line.trim();
+      if (!trimmed) return;
+      if (trimmed === '[CHARACTERS]') { currentSection = 'CHARACTERS'; return; }
+      if (trimmed === '[LOCATIONS]') { currentSection = 'LOCATIONS'; return; }
+      if (trimmed === '[PROPS]') { currentSection = 'PROPS'; return; }
+      
+      if (currentSection && trimmed.includes('|')) {
+        const parts = trimmed.split('|').map(p => p.trim());
+        if (parts.length >= 2) {
+          sections[currentSection].push(parts);
+        }
+      }
+    });
+    return sections;
+  };
+  const assetData = useMemo(() => parseAssetTable(extractAssetDefinitions(processed)), [processed]);
+  const saveToHistory = (newContent: string) => {
+    const count = (newContent.match(/^\s*\[?\s*SCENE\s+\d+/gim) || []).length;
+    const item: ScriptHistoryItem = {
+      id: Math.random().toString(36).substr(2, 9),
+      timestamp: Date.now(),
+      content: newContent,
+      sceneCount: count
+    };
+    const newHistory = [item, ...history].slice(0, 10);
+    return newHistory;
+  };
+  const generateTextWithTimeout = async (prompt: string, options: any) => {
+    const timeoutPromise = new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('TIMEOUT')), GENERATION_TIMEOUT_MS)
+    );
+    
+    return Promise.race([
+      Flow.generate.text(prompt, options),
+      timeoutPromise
+    ]) as Promise<any>;
+  };
+  const runAssetBiblePipeline = async (screenplay: string, setProgress: (t: string) => void, scriptState: ScriptData = state.script): Promise<{ assetBlock: string; alert?: any }> => {
+    const world = resolveStoryWorld(scriptState);
+    const activeGenre = genre === 'กำหนดเอง' ? customGenre : genre;
+    const commonPrefix = `Story world: ${world.en}. Genre: ${activeGenre}.`;
+    const systemInstruction = "You are a professional production designer. Return ONLY the line-by-line asset list for the requested category. Format: Name | Visual Prompt (English). Write every Name exactly as it appears in the script, in the script's own language and alphabet; never translate or romanize names. No headers, no markdown, no conversational text.";
+    const formatInstruction = "Output one item per line, exactly in this format: Name copied exactly as written in the script (same language and alphabet, never translated or romanized) | English visual description.\nNo numbering, no bullets, no headers, no other text.";
+    const chunks: string[] = [];
+    let currentChunkText = "";
+    for (const line of screenplay.split('\n')) {
+      if (currentChunkText.length + line.length > 3000 && currentChunkText.trim()) {
+        chunks.push(currentChunkText.trim());
+        currentChunkText = "";
+      }
+      currentChunkText += line + "\n";
+    }
+    if (currentChunkText.trim()) chunks.push(currentChunkText.trim());
+    const categories = [
+      { 
+        id: 'CHARACTERS', 
+        label: 'ตัวละคร (1/3)', 
+        promptFn: (snip: string, already: string) => `${commonPrefix} List every character who appears or speaks in this part, including minor characters with lines and anyone in a cast list. One line per character. Name = the name used most in the script, written in the script's own alphabet (a Thai script keeps Thai names). Start each Visual Prompt with the character's ethnicity or nationality. ${world.people ? `If unknown, use ${world.people}.` : "If unknown, infer it from the story world."} Every Visual Prompt must describe the outfit concretely matching character's own era. Default: ${world.outfit}. ${already ? `Already listed: [${already}]. Only add new characters; if nobody new appears in this part, output NONE.` : ""}\n\n${formatInstruction}\n\nSCRIPT:\n${snip}` 
+      },
+      { 
+        id: 'LOCATIONS', 
+        label: 'สถานที่ (2/3)', 
+        promptFn: (snip: string, already: string) => `${commonPrefix} List every real physical place. One line per place. Name is a short place name in the script's own language and alphabet, without time of day. Visual Prompt describes architecture, materials, layout and key objects. Parts of the same place are ONE location: a counter, kitchen, doorway, table or corner inside the same shop or house belongs to that shop or house. The street right outside a building may be one separate location. Time of day, weather or lighting changes never create a new location. Different buildings or outdoor areas are separate locations (a house, a warehouse, an alley and a pier are four locations). ${already ? `Already listed: [${already}]. Only add new places; if nothing new appears in this part, output NONE.` : ""}\n\n${formatInstruction}\n\nSCRIPT:\n${snip}` 
+      },
+      { 
+        id: 'PROPS', 
+        label: 'อุปกรณ์ (3/3)', 
+        promptFn: (snip: string, already: string) => `${commonPrefix} List every object a character holds, uses, gives, receives or reacts to. Do not list generic furniture. Visual Prompt describes material, shape, color, size. ${already ? `Already listed: [${already}]. Only add new items.` : ""}\n\n${formatInstruction}\n\nSCRIPT:\n${snip}` 
+      }
+    ];
+    const results: Record<string, {name: string, desc: string}[]> = { CHARACTERS: [], LOCATIONS: [], PROPS: [] };
+    const errors: string[] = [];
+    let alertData = null;
+    for (const cat of categories) {
+      if (cat.id === 'PROPS') {
+        setProgress(`กำลังดึง${cat.label}`);
+        const r = await pullAssetItems('Prop', screenplay, world.en, state.config.textModel, (t) => setProgress(`กำลังดึง${cat.label} · ${t}`), () => abortRef.current);
+        results.PROPS = r.items;
+        if (r.okCount === 0) errors.push(`อุปกรณ์: ${friendlyError(r.lastError?.message || String(r.lastError || ''))} — ใช้เมนู "ดึงข้อมูล → หาอุปกรณ์เพิ่ม (AI)" ใน STEP 3 แทนได้`);
+        else if (r.failedParts.length > 0) errors.push(`อุปกรณ์: บางช่วง AI ไม่ตอบ (${r.failedParts.length} ส่วน) — หาเพิ่มได้ใน STEP 3`);
+        continue;
+      }
+      const seenNames = new Set<string>();
+      let lastCatError = "";
+      
+      for (let i = 0; i < chunks.length; i++) {
+        if (abortRef.current) throw new Error('CANCELLED');
+        const chunk = chunks[i];
+        
+        let chunkSuccess = false;
+        let attempt = 1;
+        let lastRawResponse = "";
+        while (attempt <= 3 && !chunkSuccess) {
+          setProgress(`กำลังดึง${cat.label} · ช่วง ${i + 1}/${chunks.length} (ครั้งที่ ${attempt})`);
+          try {
+            const currentModel = attempt === 3 ? 'low' : state.config.textModel;
+            const res = await generateTextWithTimeout(cat.promptFn(chunk, Array.from(seenNames).join(', ')), { systemInstruction, thinkingLevel: currentModel });
+            
+            const text = typeof res?.text === 'string' ? res.text : '';
+            lastRawResponse = text;
+            if (!text.trim()) throw new Error('AI ไม่ได้ส่งข้อความกลับ');
+            const parsed = parseAssetLines(text);
+            let itemsInChunk = 0;
+            
+            parsed.forEach(item => {
+              if (item.name && item.desc && !seenNames.has(item.name.toLowerCase())) {
+                seenNames.add(item.name.toLowerCase());
+                results[cat.id].push(item);
+                itemsInChunk++;
+              }
+            });
+            
+            if (itemsInChunk > 0 || parsed.length > 0 || /^\s*NONE\s*$/im.test(text)) {
+              chunkSuccess = true;
+            } else {
+              lastCatError = text.substring(0, 150);
+              attempt++;
+            }
+          } catch (err: any) {
+            lastCatError = `${err.name || 'Error'}: ${err.message || String(err)}`;
+            attempt++;
+          }
+        }
+        if (!chunkSuccess && (cat.id === 'CHARACTERS' || cat.id === 'LOCATIONS')) {
+          setProgress(`กำลังดึง${cat.label} · ช่วง ${i + 1}/${chunks.length} (ตัวสำรอง)`);
+          try {
+            const shortPrompt = cat.id === 'CHARACTERS' 
+              ? `List the characters in this script, one per line: Name exactly as written in the script (same language and alphabet) | English visual description of ethnicity, age, build, face, hair and outfit.\n\nSCRIPT:\n${chunk}`
+              : `List the places in this script, one per line: Name exactly as written in the script (same language and alphabet) | English visual description of architecture, materials and layout. Parts of the same place are ONE location: a counter, kitchen, doorway, table or corner inside the same shop or house belongs to that shop or house. The street right outside a building may be one separate location. Time of day, weather or lighting changes never create a new location. Different buildings or outdoor areas are separate locations (a house, a warehouse, an alley and a pier are four locations).\n\nSCRIPT:\n${chunk}`;
+            
+            const res = await generateTextWithTimeout(shortPrompt, { systemInstruction, thinkingLevel: 'low' });
+            const text = typeof res?.text === 'string' ? res.text : '';
+            lastRawResponse = text;
+            if (text.trim()) {
+              const parsed = parseAssetLines(text);
+              let itemsInChunk = 0;
+              parsed.forEach(item => {
+                if (item.name && item.desc && !seenNames.has(item.name.toLowerCase())) {
+                  seenNames.add(item.name.toLowerCase());
+                  results[cat.id].push(item);
+                  itemsInChunk++;
+                  chunkSuccess = true;
+                }
+              });
+            }
+          } catch (e) {}
+        }
+        if (!chunkSuccess) {
+          console.log('[ดึงรายชื่อ]', cat.id, `ช่วงที่ ${i+1}`, lastRawResponse.substring(0, 300));
+        }
+      }
+      if (results[cat.id].length === 0) {
+        const catName = cat.label.split(' ')[0];
+        let usingRegexFallback = false;
+        
+        if (cat.id === 'CHARACTERS') {
+          const speakers = Array.from(new Set(screenplay.match(/^([^:\n\r\[\]]+):\s*"/gm) || [])).map(s => s.split(':')[0].trim());
+          if (speakers.length > 0) {
+            results.CHARACTERS = speakers.map(s => ({ name: s, desc: `${world.people || 'person'}, ${world.en}` }));
+            usingRegexFallback = true;
+          }
+        } else if (cat.id === 'LOCATIONS') {
+          const locs = Array.from(new Set(screenplay.match(/สถานที่:\s*([^\n\r]+)/g) || [])).map(l => l.replace('สถานที่:', '').trim());
+          if (locs.length > 0) {
+            results.LOCATIONS = locs.map(l => ({ name: l, desc: `${l}, ${world.en}` }));
+            usingRegexFallback = true;
+          }
+        }
+        if (usingRegexFallback) {
+          errors.push(`${catName}: ใช้คำบรรยายสำรอง — แก้ใน STEP 3 หรือกดดึงใหม่ (สาเหตุ: ${lastCatError ? friendlyError(lastCatError) : "ดึงข้อมูลไม่สำเร็จ"})`);
+        } else {
+          errors.push(`${catName}: ${lastCatError ? friendlyError(lastCatError) : "ดึงข้อมูลไม่สำเร็จ"}`);
+        }
+      }
+    }
+    if (errors.length > 0) {
+      alertData = { 
+        message: "ดึงข้อมูลบางส่วนไม่สำเร็จ (ตรวจสอบสาเหตุข้างล่าง)", 
+        details: errors.join('\n') 
+      };
+    }
+    const reindexed: string[] = ['[ASSET DEFINITIONS]'];
+    ['CHARACTERS', 'LOCATIONS', 'PROPS'].forEach(id => {
+      reindexed.push(`[${id}]`);
+      const prefix = id === 'CHARACTERS' ? '@CH' : id === 'LOCATIONS' ? '@LOC' : '@PROP';
+      results[id].forEach((item, idx) => {
+        const safeDesc = item.desc.replace(/\|/g, ',');
+        reindexed.push(`${prefix}${(idx + 1).toString().padStart(2, '0')} | ${item.name} | ${safeDesc}`);
+      });
+    });
+    reindexed.push('[END ASSET DEFINITIONS]');
+    
+    return { assetBlock: reindexed.join('\n'), alert: alertData };
+  };
+  // โหมดบทของฉัน: ถ้าโลกของเรื่องยังเป็นค่าเริ่มต้น ให้อ่านยุคจากบทเอง
+  const detectWorldFromScript = async (base: ScriptData, setProgress?: (t: string) => void): Promise<{ next: ScriptData; note: string }> => {
+    if (base.scriptMode !== 'user' || base.setting !== 'ไทยร่วมสมัย') return { next: base, note: '' };
+    setProgress?.('กำลังอ่านยุคของเรื่องจากบท...');
+    try {
+      const res = await generateTextWithTimeout(
+        `Read the start of this script and state its story world: country, era or period, and social setting.\nReply in exactly two lines:\nEN: short English description, at most 15 words\nTH: short Thai description, at most 15 words\nIf the story is set in present-day Thailand, reply with the single word MODERN.\n\nSCRIPT:\n${(base.original || '').substring(0, 4000)}`,
+        { systemInstruction: 'You identify the story world of a script. Output only the requested lines.', thinkingLevel: 'low' }
+      );
+      const t = typeof res?.text === 'string' ? res.text.trim() : '';
+      const en = t.match(/EN:\s*(.+)/i)?.[1]?.trim();
+      const th = t.match(/TH:\s*(.+)/i)?.[1]?.trim();
+      if (!en || /^MODERN\b/i.test(t)) return { next: base, note: '' };
+      return { next: { ...base, setting: 'กำหนดเอง', customSetting: en, customSettingThai: th || en }, note: th || en };
+    } catch {
+      return { next: base, note: '' };
+    }
+  };
+  const handleProcessClick = () => {
+    if (stopping) return;
+    if (scriptMode !== 'user' && !timeValidation.valid) return;
+    if (processed && processed.trim().length > 0) {
+      setShowOverwriteConfirm(true);
+    } else {
+      executeGeneration();
+    }
+  };
+  const handleReExtractAssets = () => {
+    if (stopping) return;
+    const screenplay = extractScreenplayOnly(processed);
+    if (!screenplay) {
+      setInputFeedback({ type: 'error', message: 'ไม่พบเนื้อหาบทที่ใช้ดึงองค์ประกอบ' });
+      return;
+    }
+    setInputFeedback(null);
+    abortRef.current = false;
+    runTask('step1-assets', 1, 'ดึงตัวละครและฉาก', async (setProgress) => {
+      const detected = await detectWorldFromScript(state.script, setProgress);
+      const { assetBlock, alert } = await runAssetBiblePipeline(screenplay, setProgress, detected.next);
+      if (abortRef.current) throw new Error('CANCELLED');
+      const finalProcessed = `${assetBlock}\n\n${screenplay}`;
+      
+      onUpdate({ 
+        ...detected.next, 
+        processed: finalProcessed,
+        history: saveToHistory(finalProcessed)
+      });
+      
+      const charCountParsed = (assetBlock.match(/@CH\d+/g) || []).length;
+      return {
+        feedback: { type: 'success', message: `ดึงองค์ประกอบใหม่เรียบร้อย — พบ ${charCountParsed} ตัวละคร${detected.note ? ` · ตั้งโลกของเรื่องตามบท: ${detected.note}` : ''}` },
+        alert
+      };
+    });
+  };
+  const handleCancel = () => {
+    setStopping(true);
+    abortRef.current = true;
+    setInputFeedback({ type: 'info', message: 'กำลังหยุดงานเดิม...' });
+  };
+  const executeGeneration = () => {
+    setShowOverwriteConfirm(false);
+    if (stopping) return;
+    if (scriptMode !== 'user' && !timeValidation.valid) return;
+    setInputFeedback(null);
+    abortRef.current = false;
+    setHasJustImported(false);
+    runTask('step1-script', 1, 'เขียนบท', async (setProgress) => {
+      let currentScriptState = { ...state.script };
+      let screenplay = '';
+      if (currentScriptState.spokenLanguage === 'กำหนดเอง (Custom)' && 
+          currentScriptState.customSpokenLanguage && 
+          !currentScriptState.customSpokenLanguageEn) {
+        
+        const translationPrompt = `Translate the following language name from Thai to a short English language name. Language name: ${currentScriptState.customSpokenLanguage}`;
+        const nameRes = await generateTextWithTimeout(translationPrompt, { 
+          systemInstruction: "You are a translator. Output only the short English name of the language.",
+          thinkingLevel: state.config.textModel 
+        });
+        const text = typeof nameRes?.text === 'string' ? nameRes.text : '';
+        if (!text.trim()) throw new Error('AI ไม่ได้ส่งข้อความกลับ');
+        currentScriptState.customSpokenLanguageEn = text.trim();
+      }
+      const detected = await detectWorldFromScript(currentScriptState, setProgress);
+      currentScriptState = detected.next;
+      if (scriptMode === 'user') {
+        screenplay = original.trim();
+      } else {
+        setProgress('ขั้น 1/2 — กำลังเขียนบท...');
+        
+        const spoken = resolveSpokenLanguage(currentScriptState);
+        const scriptLang = resolveScriptLanguage(currentScriptState);
+        const world = resolveStoryWorld(currentScriptState);
+        const activeGenre = genre === 'กำหนดเอง' ? customGenre : genre;
+        const targetScenes = metrics.editedShots;
+        const sceneLen = metrics.sceneLength;
+        let languageInstructions = `Write action and scene description in ${scriptLang}.\n`;
+        languageInstructions += `All dialogue must be written in ${spoken.en}.\n`;
+        languageInstructions += `Format every dialogue line as: CharacterName: "line"\n`;
+        if (spoken.isThai) languageInstructions += `Spell dialect words in Thai script.\n`;
+        if (!spoken.isThai) languageInstructions += `After each dialogue line add a Thai translation: [แปล: ...]\n`;
+        if (spoken.isMulti) languageInstructions += `Write the language before each line, e.g. นพ [Thai]: "..."\n`;
+        const buildPrompt = (idea: string) => `Generate a screenplay. Genre: ${activeGenre}. Setting: ${world.th} (${world.en}). ${extraNotes || ''} Base Idea: ${idea}.
+        MUST use [SCENE N] headers. Exactly ${targetScenes} scenes if possible.
+        Total film length: ${timeValidation.seconds} seconds. Each scene about ${sceneLen} seconds.\n\n${languageInstructions}`;
+        const attempts: { level: any; idea: string; sys: string }[] = [
+          { level: state.config.textModel, idea: original.substring(0, MAX_SCRIPT_CHARS), sys: "You are a professional screenwriter. Output clear scenes with [SCENE N] headers." },
+          { level: state.config.textModel, idea: original.substring(0, 12000), sys: "You are a screenwriter. Write only the screenplay, using [SCENE N] headers. No notes, no preamble." },
+          { level: 'low', idea: original.substring(0, 6000), sys: "Write a screenplay with [SCENE N] headers. Plain text only." },
+        ];
+        let scriptText = '';
+        const tries: string[] = [];
+        for (let i = 0; i < attempts.length; i++) {
+          if (abortRef.current) throw new Error('CANCELLED');
+          setProgress(`ขั้น 1/2 — กำลังเขียนบท (ครั้งที่ ${i + 1}/${attempts.length})...`);
+          try {
+            const res = await generateTextWithTimeout(buildPrompt(attempts[i].idea), { systemInstruction: attempts[i].sys, thinkingLevel: attempts[i].level });
+            const t = typeof res?.text === 'string' ? res.text : '';
+            if (t.trim()) { scriptText = t; break; }
+            tries.push(`ครั้งที่ ${i + 1}: AI ตอบว่าง`);
+          } catch (err: any) {
+            tries.push(`ครั้งที่ ${i + 1}: ${err?.message || String(err)}`);
+          }
+          if (i < attempts.length - 1) await new Promise(r => setTimeout(r, 2000));
+        }
+        if (abortRef.current) throw new Error('CANCELLED');
+        if (!scriptText.trim()) throw new Error(tries.join(' | ') || 'AI ไม่ได้ส่งข้อความกลับ');
+        screenplay = scriptText.replace(/[\*#_]/g, '').trim();
+      }
+      setProgress('ขั้น 2/2 — กำลังดึงองค์ประกอบ...');
+      const { assetBlock, alert } = await runAssetBiblePipeline(screenplay, setProgress, currentScriptState);
+      
+      if (abortRef.current) throw new Error('CANCELLED');
+      const finalScreenplay = scriptMode === 'user' ? original.trim() : screenplay;
+      const finalProcessed = `${assetBlock}\n\n${finalScreenplay}`;
+      
+      onUpdate({ 
+        ...currentScriptState, 
+        processed: finalProcessed,
+        history: saveToHistory(finalProcessed),
+        durationSeconds: timeValidation.valid ? timeValidation.seconds : currentScriptState.durationSeconds
+      });
+      
+      const charCountParsed = (assetBlock.match(/@CH\d+/g) || []).length;
+      const sceneCountParsed = (finalScreenplay.match(/^\s*\[?\s*SCENE\s+\d+/gim) || []).length;
+      return {
+        feedback: { type: 'success', message: `สร้างบทและองค์ประกอบเรียบร้อย — ${sceneCountParsed} ฉาก ${charCountParsed} ตัวละคร${detected.note ? ` · ตั้งโลกของเรื่องตามบท: ${detected.note}` : ''}` },
+        alert
+      };
+    });
+  };
+  const timeValidation = useMemo(() => {
+    if (!durationRaw || !durationRaw.trim()) return { valid: false, seconds: 0, message: '' };
+    const clean = durationRaw.replace(/[^0-9.:]/g, '');
+    const parts = clean.includes(':') ? clean.split(':') : clean.split('.');
+    let totalSeconds = 0;
+    if (parts.length === 1) totalSeconds = (parseInt(parts[0]) || 0) * 60;
+    else totalSeconds = (parseInt(parts[0]) || 0) * 60 + (parseInt(parts[1]) || 0);
+    if (totalSeconds <= 0) return { valid: false, seconds: 0, message: 'รูปแบบเวลาไม่ถูกต้อง' };
+    const actualMins = Math.floor(totalSeconds / 60);
+    const actualSecs = totalSeconds % 60;
+    let displayMsg = actualMins > 0 ? `= ${actualMins} นาที ${actualSecs > 0 ? `${actualSecs} วินาที` : ''}`.trim() : `= ${actualSecs} วินาที`;
+    if (totalSeconds < 5) return { valid: false, seconds: totalSeconds, message: 'สั้นเกินไป (ต่ำสุด 5 วินาที)' };
+    if (totalSeconds > 1800) return { valid: false, seconds: totalSeconds, message: 'ยาวเกินไป (สูงสุด 30 นาที)' };
+    return { valid: true, seconds: totalSeconds, message: displayMsg };
+  }, [durationRaw]);
+  const metrics = useMemo(() => {
+    let groupName = "อื่นๆ";
+    for (const [group, items] of Object.entries(GENRE_GROUPS)) {
+      if (items.includes(genre)) { groupName = group; break; }
+    }
+    if (genre === 'กำหนดเอง') groupName = "กำหนดเอง";
+    const sceneLength = SCENE_LENGTH_SECONDS[groupName] || 20;
+    const totalSecs = timeValidation.seconds || durationSeconds;
+    const autoSceneCount = Math.max(1, Math.round(totalSecs / sceneLength));
+    const editedShots = sceneCeiling === 'auto' ? autoSceneCount : Math.min(autoSceneCount, sceneCeiling as number);
+    return { editedShots, totalSecs, sceneLength };
+  }, [durationSeconds, timeValidation, genre, sceneCeiling]);
+  useEffect(() => {
+    if (state.config.maxScenes !== metrics.editedShots) {
+      onConfigUpdate({ ...state.config, maxScenes: metrics.editedShots });
+    }
+  }, [metrics.editedShots, state.config.maxScenes, onConfigUpdate]);
+  // เวลาเรื่องที่พิมพ์ ส่งถึง STEP 4 ทันที (STEP 4 ใช้เป็นเป้าจำนวนช็อตและเวลารวม)
+  useEffect(() => {
+    if (!loading && timeValidation.valid && timeValidation.seconds !== state.script.durationSeconds) {
+      onUpdate({ ...state.script, durationSeconds: timeValidation.seconds });
+    }
+  }, [loading, timeValidation, state.script.durationSeconds]);
+  const missingRequirements = useMemo(() => {
+    const reqs = [];
+    if (!processed || extractScreenplayOnly(processed).length < 50) {
+      reqs.push(scriptMode === 'user' ? "กรุณากด 'ใช้บทนี้ + ดึงตัวละครและฉาก'" : "กรุณากดเขียนบทด้วย AI");
+    }
+    if (scriptMode !== 'user' && !timeValidation.valid) reqs.push("ระบุความยาวเรื่องให้ถูกต้อง");
+    if (setting === 'กำหนดเอง' && !customSetting?.trim()) reqs.push("ระบุโลกของเรื่อง");
+    if (genre === 'กำหนดเอง' && !customGenre?.trim()) reqs.push("ระบุแนวเรื่อง");
+    if (spokenLanguage === 'กำหนดเอง (Custom)' && !customSpokenLanguage?.trim()) reqs.push("ระบุภาษาพูด");
+    return reqs;
+  }, [processed, timeValidation.valid, setting, customSetting, genre, customGenre, spokenLanguage, customSpokenLanguage, scriptMode]);
+  const handleUndo = () => {
+    if (history.length > 1) {
+      const prev = history[1];
+      onUpdate({ ...state.script, processed: prev.content, history: history.slice(1) });
+    }
+  };
+  const formatTimer = (secs: number) => {
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    return `${m}:${s.toString().padStart(2, '0')}`;
+  };
+  const handleBlurSetting = async () => {
+    const text = state.script.customSetting || '';
+    if (!/[ก-๙]/.test(text)) return;
+    try {
+      const res: any = await Flow.generate.text(`Translate this story setting from Thai to short English, word for word, no extra words. Text: ${text}`, { systemInstruction: 'You are a faithful translator. Output only the translation.', thinkingLevel: state.config.textModel });
+      const en = typeof res?.text === 'string' ? res.text.trim() : '';
+      if (en) onUpdate({ ...state.script, customSetting: en, customSettingThai: text });
+    } catch {}
+  };
+  const getSettingsSummary = () => {
+    const s = setting === 'กำหนดเอง' ? (state.script.customSettingThai || customSetting || 'กำหนดเอง') : setting;
+    const g = genre === 'กำหนดเอง' ? (customGenre || 'กำหนดเอง') : genre;
+    const sl = spokenLanguage === 'กำหนดเอง (Custom)' ? (customSpokenLanguage || 'กำหนดเอง (Custom)') : spokenLanguage;
+    const m = TEXT_MODELS.find(x => x.value === state.config.textModel)?.label || '';
+    return `${s} · ${g} · ${sl} · ${language} · ${m}`;
+  };
+  const isTooLong = original.length > MAX_SCRIPT_CHARS;
+  const importFile = async (file: File) => {
+    const readAsText = (encoding = 'UTF-8') => new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = reject;
+      reader.readAsText(file, encoding);
+    });
+    try {
+      let text = '';
+      if (file.name.toLowerCase().endsWith('.txt')) {
+        text = await readAsText('UTF-8');
+        const isBroken = /[\uFFFD]/.test(text) || (!/[ก-๙]/.test(text) && /[^\x00-\x7F]/.test(text));
+        if (isBroken) text = await readAsText('windows-874');
+      } else {
+        text = await parseScriptFile(file);
+      }
+      const normalized = normalizeImportedText(text);
+      onUpdate({ ...state.script, original: normalized, scriptMode: 'user' });
+      setHasJustImported(true);
+      setInputFeedback({ type: 'success', message: `นำเข้าแล้ว: ${file.name} · ${normalized.length.toLocaleString()} ตัวอักษร`, details: 'สลับเข้าสู่โหมด "ใช้บทของฉัน" อัตโนมัติ' });
+    } catch (err) {
+      setInputFeedback({ type: 'error', message: `ไฟล์นี้ใช้ไม่ได้: ${file.name}`, details: err instanceof Error ? err.message : String(err) });
+    }
+  };
+  const handleFileImport = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    importFile(file);
+    e.target.value = '';
+  };
+  return (
+    <div className="flex flex-col gap-6 pb-20">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-7">
+        <div className="space-y-5">
+          <div className="space-y-3">
+            <div className="flex bg-[var(--ui-surface-soft)] p-1 rounded-xl border border-[var(--ui-border)] gap-1">
+              <button onClick={() => onUpdate({ ...state.script, scriptMode: 'ai' })} className={`flex-1 py-3 rounded-lg flex flex-col items-center justify-center transition-all ${scriptMode === 'ai' ? 'bg-[var(--ui-primary)] text-white shadow-md' : 'text-[var(--ui-text-muted)] hover:bg-black/5'}`}>
+                <span className="text-[12px] font-black uppercase tracking-widest">AI เขียนบทให้</span>
+              </button>
+              <button onClick={() => onUpdate({ ...state.script, scriptMode: 'user' })} className={`flex-1 py-3 rounded-lg flex flex-col items-center justify-center transition-all ${scriptMode === 'user' ? 'bg-[var(--ui-accent)] text-black shadow-md' : 'text-[var(--ui-text-muted)] hover:bg-black/5'}`}>
+                <span className="text-[12px] font-black uppercase tracking-widest">ใช้บทของฉัน (ไม่แก้ไข)</span>
+              </button>
+            </div>
+            <p className="text-center text-[10px] font-bold text-[var(--ui-text-muted)] uppercase tracking-widest animate-in fade-in duration-300">
+              {scriptMode === 'ai' ? 'พิมพ์ไอเดียหรือเรื่องย่อ AI จะเขียนบทให้' : 'วางหรือนำเข้าบทของคุณ ระบบจะใช้ตามเดิมทุกคำ'}
+            </p>
+          </div>
+          <div className="space-y-2">
+            <label style={{ fontSize: 'var(--fs-label)' }} className={`font-bold uppercase tracking-widest block ${scriptMode === 'user' ? 'text-[var(--ui-accent)]' : 'text-[var(--ui-primary)]'}`}>
+              {scriptMode === 'user' ? 'บทของคุณ' : 'ต้นฉบับ / ไอเดีย'}
+            </label>
+            <div
+              className="relative"
+              onDragOver={(e) => { e.preventDefault(); if (!loading) setIsDragging(true); }}
+              onDragLeave={(e) => { e.preventDefault(); setIsDragging(false); }}
+              onDrop={(e) => {
+                e.preventDefault();
+                setIsDragging(false);
+                if (loading) return;
+                const file = e.dataTransfer.files?.[0];
+                if (file) importFile(file);
+              }}
+            >
+              <textarea value={original} onChange={(e) => onUpdate({ ...state.script, original: e.target.value })} placeholder={scriptMode === 'user' ? "วางบทหนังของคุณที่นี่..." : "พิมพ์หรือวางไอเดียที่นี่..."} disabled={loading} className={`w-full h-44 bg-[var(--ui-input)] border rounded-xl p-4 outline-none resize-none font-medium transition-all ${isTooLong ? 'border-amber-500' : 'border-[var(--ui-border)]'} ${loading ? 'opacity-50' : ''}`} />
+              {isDragging && (
+                <div className="absolute inset-0 z-20 rounded-xl border-2 border-dashed border-[var(--ui-accent)] bg-[var(--ui-bg)]/85 backdrop-blur-sm flex flex-col items-center justify-center gap-2 pointer-events-none">
+                  <span className="material-symbols-outlined text-4xl text-[var(--ui-accent)]">upload_file</span>
+                  <span className="text-[13px] font-black text-[var(--ui-accent)] uppercase tracking-widest">วางไฟล์บทที่นี่</span>
+                  <span className="text-[10px] font-bold text-[var(--ui-text-muted)]">.txt .md .srt .vtt .csv .json .rtf .odt .html .fdx</span>
+                </div>
+              )}
+            </div>
+            
+            {scriptMode === 'user' && hasJustImported && (
+               <p className="text-[11px] font-black text-amber-500 uppercase tracking-widest px-1 animate-pulse">ตรวจข้อความแล้วกด 'ใช้บทนี้ + ดึงตัวละครและฉาก'</p>
+            )}
+            {scriptMode === 'ai' && isTooLong && (
+               <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-lg flex items-start gap-2 animate-in slide-in-from-top-1">
+                 <span className="material-symbols-outlined text-amber-500 text-lg">warning</span>
+                 <p className="text-[10px] font-bold text-amber-500 leading-normal">ไอเดียยาว {original.length.toLocaleString()} ตัวอักษร ส่วนที่เกิน 30,000 จะไม่ถูกส่งให้ AI เขียนบท</p>
+               </div>
+            )}
+            <div className="flex gap-2">
+              <button onClick={() => fileInputRef.current?.click()} disabled={loading} className="flex-1 py-2.5 bg-[var(--ui-surface-soft)] border border-[var(--ui-border)] rounded-lg text-[11px] font-bold uppercase tracking-widest text-[var(--ui-text-primary)] flex items-center justify-center gap-2 hover:bg-[var(--ui-surface-raised)] disabled:opacity-30"><span className="material-symbols-outlined text-base">upload_file</span> นำเข้าไฟล์</button>
+              <input ref={fileInputRef} type="file" accept=".txt,.md,.markdown,.fountain,.srt,.vtt,.csv,.json,.docx,.rtf,.odt,.html,.htm,.fdx" className="hidden" onChange={handleFileImport} />
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+             <div className="space-y-1.5">
+                <label style={{ fontSize: 'var(--fs-micro)' }} className="uppercase tracking-widest text-[var(--ui-text-muted)] block font-bold">ขีดจำกัดจำนวนฉาก</label>
+                <select value={sceneCeiling} disabled={loading} onChange={(e) => onUpdate({ ...state.script, sceneCeiling: e.target.value === 'auto' ? 'auto' : parseInt(e.target.value) as any })} className="w-full bg-[var(--ui-input)] border border-[var(--ui-border)] rounded-lg px-3 h-10 outline-none text-sm disabled:opacity-30">
+                  {SCENE_CEILING_OPTIONS.map(opt => <option key={opt.label} value={opt.value}>{opt.label}</option>)}
+                </select>
+             </div>
+             <div className="space-y-1.5">
+                <label style={{ fontSize: 'var(--fs-micro)' }} className="uppercase tracking-widest text-[var(--ui-text-muted)] block font-bold">ความยาวเรื่อง</label>
+                <input type="text" value={durationRaw} disabled={loading} onChange={e => onUpdate({ ...state.script, durationRaw: e.target.value })} placeholder="เช่น 1.30 = 1 นาที 30 วินาที" className={`w-full bg-[var(--ui-input)] border rounded-lg px-3 h-10 outline-none text-sm transition-colors ${scriptMode !== 'user' && !timeValidation.valid && durationRaw ? 'border-red-500' : 'border-[var(--ui-border)]'} ${loading ? 'opacity-30' : ''}`} />
+                {durationRaw && <p style={{ fontSize: 'var(--fs-micro)' }} className={`mt-1 font-bold ${timeValidation.valid ? 'text-[var(--ui-text-muted)]' : 'text-red-500'}`}>{timeValidation.message} {timeValidation.valid && scriptMode !== 'user' && ` · ประมาณ ${metrics.editedShots} ฉาก`}</p>}
+                {scriptMode === 'user' && (
+                  <p style={{ fontSize: 'var(--fs-micro)' }} className="mt-1 font-black text-amber-500 uppercase tracking-widest">โหมดบทของฉัน: STEP 4 จะแบ่งช็อตให้ใกล้เวลานี้ · ถ้าบทพูดยาวเกิน หนังจะยาวกว่านี้ (ไม่ตัดบท)</p>
+                )}
+             </div>
+          </div>
+          <div className="border border-[var(--ui-border)] rounded-xl overflow-hidden bg-[var(--ui-surface-soft)]">
+            <button onClick={() => setIsSettingsOpen(!isSettingsOpen)} disabled={loading} className={`w-full px-4 py-3 flex items-center justify-between hover:bg-[var(--ui-surface-raised)] transition-colors ${loading ? 'opacity-30' : ''}`}>
+              <div className="flex items-center gap-3">
+                <span className="material-symbols-outlined text-lg text-[var(--ui-accent)]">tune</span>
+                <div className="text-left">
+                  <span className="text-[12px] font-extrabold uppercase tracking-widest text-[var(--ui-text-primary)]">ตั้งค่าเรื่อง (STORY SETTINGS)</span>
+                  {!isSettingsOpen && <p className="text-[10px] text-[var(--ui-text-muted)] font-medium mt-0.5">{getSettingsSummary()}</p>}
+                </div>
+              </div>
+              <span className={`material-symbols-outlined transition-transform duration-300 ${isSettingsOpen ? 'rotate-180' : ''}`}>expand_more</span>
+            </button>
+            {isSettingsOpen && (
+              <div className="p-4 border-t border-[var(--ui-border)] space-y-4 animate-in slide-in-from-top-1 duration-200">
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-1">
+                    <label className="text-[10px] uppercase font-bold text-[var(--ui-text-muted)]">โลกของเรื่อง</label>
+                    <select value={setting} onChange={e => onUpdate({ ...state.script, setting: e.target.value })} className="w-full bg-[var(--ui-input)] border border-[var(--ui-border)] rounded-lg px-2 h-9 text-xs outline-none">
+                      {SETTINGS.map(s => <option key={s} value={s}>{s}</option>)}
+                    </select>
+                    {setting === 'กำหนดเอง' && <CustomSettingsInput value={customSetting || ''} onBlur={handleBlurSetting} onChange={v => onUpdate({ ...state.script, customSetting: v, customSettingThai: undefined })} placeholder="เช่น ไทยยุค 2540, ญี่ปุ่นสมัยเมจิ" />}
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-[10px] uppercase font-bold text-[var(--ui-text-muted)]">แนวเรื่อง</label>
+                    <select value={genre} onChange={e => onUpdate({ ...state.script, genre: e.target.value })} className="w-full bg-[var(--ui-input)] border border-[var(--ui-border)] rounded-lg px-2 h-9 text-xs outline-none">
+                      {Object.values(GENRE_GROUPS).flat().map(g => <option key={g} value={g}>{g}</option>)}
+                    </select>
+                    {genre === 'กำหนดเอง' && <CustomSettingsInput value={customGenre || ''} onChange={v => onUpdate({ ...state.script, customGenre: v })} placeholder="เช่น หนังนัวร์สืบสวน, ดราม่าผสมตลก" />}
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-1">
+                    <label className="text-[10px] uppercase font-bold text-[var(--ui-text-muted)]">ภาษาของบท</label>
+                    <select value={language} onChange={e => onUpdate({ ...state.script, language: e.target.value })} className="w-full bg-[var(--ui-input)] border border-[var(--ui-border)] rounded-lg px-2 h-9 text-xs outline-none"><option value="ไทย">ไทย</option><option value="English">English</option></select>
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-[10px] uppercase font-bold text-[var(--ui-text-muted)]">ภาษาพูด</label>
+                    <select value={spokenLanguage} onChange={e => onUpdate({ ...state.script, spokenLanguage: e.target.value })} className="w-full bg-[var(--ui-input)] border border-[var(--ui-border)] rounded-lg px-2 h-9 text-xs outline-none">{SPOKEN_LANGUAGES.map(sl => <option key={sl} value={sl}>{sl}</option>)}</select>
+                    {spokenLanguage === 'กำหนดเอง (Custom)' && <CustomSettingsInput value={customSpokenLanguage || ''} onChange={v => onUpdate({ ...state.script, customSpokenLanguage: v, customSpokenLanguageEn: undefined })} placeholder="เช่น ไทยปนอังกฤษ, ลาว" />}
+                  </div>
+                </div>
+                <div className="space-y-1"><label className="text-[10px] uppercase font-bold text-[var(--ui-text-muted)]">โมเดลประมวลผล</label><select value={state.config.textModel} onChange={e => onConfigUpdate({ ...state.config, textModel: e.target.value as any })} className="w-full bg-[var(--ui-input)] border border-[var(--ui-border)] rounded-lg px-2 h-9 text-xs outline-none">{TEXT_MODELS.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}</select></div>
+              </div>
+            )}
+          </div>
+          <div className="space-y-3">
+            <div className="flex flex-col gap-3">
+              <div className="flex gap-3">
+                <button onClick={handleProcessClick} disabled={loading || stopping || !original || (scriptMode !== 'user' && !timeValidation.valid)} className="flex-[3] h-14 font-black rounded-xl transition-all flex items-center justify-center gap-2 shadow-lg disabled:opacity-30 disabled:cursor-not-allowed g2-cta">
+                  {loading ? <div className="w-5 h-5 border-2 border-current border-t-transparent rounded-full animate-spin" /> : <span className="material-symbols-outlined font-bold">{stopping ? 'sync_disabled' : (scriptMode === 'user' ? 'person_search' : 'auto_awesome')}</span>}
+                  {stopping ? 'กำลังหยุดงานเดิม...' : (scriptMode === 'user' ? 'ใช้บทนี้ + ดึงตัวละครและฉาก' : 'เขียนบทด้วย AI')}
+                </button>
+                <button onClick={handleUndo} disabled={loading || history.length <= 1} className="flex-1 h-14 bg-[var(--ui-surface-soft)] border border-[var(--ui-border)] text-[var(--ui-text-muted)] rounded-xl hover:text-[var(--ui-text-primary)] disabled:opacity-20 flex items-center justify-center"><span className="material-symbols-outlined font-bold">undo</span></button>
+              </div>
+              {scriptMode !== 'user' && !timeValidation.valid && (
+                <p className="text-[11px] font-bold text-amber-500 text-center animate-pulse">ใส่ความยาวเรื่องให้ถูกก่อน เช่น 1.30 = 1 นาที 30 วินาที</p>
+              )}
+            </div>
+            {inputFeedback && (
+              <div className={`p-4 rounded-xl border flex items-start gap-3 animate-in slide-in-from-top-2 duration-300 relative ${inputFeedback.type === 'success' ? 'bg-[var(--ui-success)]/10 border-[var(--ui-success)]/20 text-[var(--ui-success)]' : inputFeedback.type === 'error' ? 'bg-[var(--ui-danger)]/10 border-[var(--ui-danger)]/20 text-[var(--ui-danger)]' : 'bg-[var(--ui-info)]/10 border-[var(--ui-info)]/20 text-[var(--ui-info)]'}`}>
+                <span className="material-symbols-outlined text-lg mt-0.5">{inputFeedback.type === 'success' ? 'check_circle' : inputFeedback.type === 'error' ? 'error' : 'info'}</span>
+                <div className="flex-1">
+                  <p className="text-[12px] font-black uppercase tracking-tight">{inputFeedback.message}</p>
+                  {inputFeedback.details && (inputFeedback.type === 'error' ? <ErrorDetails raw={inputFeedback.details} className="mt-0.5 opacity-80" /> : <p className="text-[10px] font-bold opacity-70 mt-0.5 whitespace-pre-wrap">{inputFeedback.details}</p>)}
+                </div>
+                <button onClick={() => setInputFeedback(null)} className="p-1 hover:bg-black/10 rounded transition-colors"><span className="material-symbols-outlined text-sm">close</span></button>
+              </div>
+            )}
+          </div>
+        </div>
+        <div className="space-y-4 flex flex-col h-full">
+          <div className="flex items-center justify-between">
+            <div className="flex bg-[var(--ui-surface-soft)] p-1 rounded-xl border border-[var(--ui-border)] gap-1">
+              <button onClick={() => setActiveTab('script')} disabled={loading} className={`px-4 py-1.5 rounded-lg text-[11px] font-extrabold uppercase tracking-widest transition-all ${activeTab === 'script' ? 'bg-[var(--ui-primary)] text-white shadow-md' : 'text-[var(--ui-text-muted)]'}`}>บทหนัง</button>
+              <button onClick={() => setActiveTab('assets')} disabled={loading} className={`px-4 py-1.5 rounded-lg text-[11px] font-extrabold uppercase tracking-widest transition-all ${activeTab === 'assets' ? 'bg-[var(--ui-primary)] text-white shadow-md' : 'text-[var(--ui-text-muted)]'}`}>ตัวละคร & ฉาก</button>
+            </div>
+            <button onClick={() => setShowHistory(!showHistory)} disabled={loading} className="flex items-center gap-1 text-[var(--ui-accent)] hover:underline font-bold text-[11px] uppercase"><span className="material-symbols-outlined text-base">history</span> ประวัติ</button>
+          </div>
+          <div className="flex-1 relative min-h-[600px] bg-[var(--ui-input)] border border-[var(--ui-border)] rounded-2xl shadow-inner overflow-hidden flex flex-col">
+            {!loading && activeTab === 'assets' && extractionAlert && (
+              <div className="p-4 bg-amber-500/10 border-b border-amber-500/20 flex items-start gap-3 text-amber-500 animate-in slide-in-from-top-2">
+                <span className="material-symbols-outlined text-lg mt-0.5">warning</span>
+                <div className="flex-1"><p className="text-[12px] font-black uppercase tracking-tight">{extractionAlert.message}</p><p className="text-[10px] font-bold opacity-70 mt-0.5 whitespace-pre-wrap">{extractionAlert.details}</p></div>
+                <button onClick={() => setExtractionAlert(null)} className="p-1 hover:bg-black/10 rounded transition-colors"><span className="material-symbols-outlined text-sm">close</span></button>
+              </div>
+            )}
+            {loading && activeTask && (
+              <div className="absolute inset-0 z-50 bg-[var(--ui-bg)]/80 backdrop-blur-sm flex flex-col items-center justify-center p-10 text-center animate-in fade-in duration-300">
+                <div className="relative mb-6">
+                  <div className={`w-20 h-20 border-4 rounded-full ${scriptMode === 'user' || activeTask.id === 'step1-assets' ? 'border-[var(--ui-accent)]/10' : 'border-[var(--ui-primary)]/10'}`} />
+                  <div className={`absolute inset-0 w-20 h-20 border-4 border-t-transparent rounded-full animate-spin ${scriptMode === 'user' || activeTask.id === 'step1-assets' ? 'border-[var(--ui-accent)] shadow-[0_0_20px_rgba(245,158,11,0.2)]' : 'border-[var(--ui-primary)] shadow-lg'}`} />
+                  <div className="absolute inset-0 flex items-center justify-center"><span className={`material-symbols-outlined text-3xl animate-pulse ${scriptMode === 'user' || activeTask.id === 'step1-assets' ? 'text-[var(--ui-accent)]' : 'text-[var(--ui-primary)]'}`}>{activeTask.id === 'step1-script' ? 'auto_awesome' : 'person_search'}</span></div>
+                </div>
+                <div className="space-y-3">
+                  <h3 className="text-xl font-black text-[var(--ui-text-primary)] tracking-widest">{activeTask.progress}</h3>
+                  <div className="flex items-center justify-center gap-3"><div className="px-3 py-1 bg-black/40 rounded-full border border-white/5"><span className={`font-mono font-black text-lg tabular-nums ${scriptMode === 'user' || activeTask.id === 'step1-assets' ? 'text-[var(--ui-accent)]' : 'text-[var(--ui-primary)]'}`}>{formatTimer(elapsed)}</span></div></div>
+                </div>
+                <button onClick={handleCancel} className="mt-10 px-8 py-3 bg-[var(--ui-surface-soft)] border border-[var(--ui-border)] text-[var(--ui-text-muted)] font-black rounded-xl hover:text-[var(--ui-text-primary)] hover:bg-[var(--ui-danger)]/10 hover:border-[var(--ui-danger)]/30 transition-all uppercase tracking-widest text-[11px]">ยกเลิก</button>
+              </div>
+            )}
+            {activeTab === 'script' && (
+              <div className="relative flex-1">
+                {scriptMode === 'user' && processed && <div className="absolute top-4 left-6 z-10 px-3 py-1 bg-[var(--ui-accent)]/20 border border-[var(--ui-accent)]/30 rounded-full flex items-center gap-2"><span className="material-symbols-outlined text-[12px] text-[var(--ui-accent)] font-bold">lock</span><span className="text-[9px] font-black uppercase text-[var(--ui-accent)] tracking-widest">บทของคุณ — ระบบไม่แก้ไขเนื้อหา</span></div>}
+                <textarea key={history[0]?.id || 'initial'} value={extractScreenplayOnly(processed)} onChange={(e) => onUpdate({ ...state.script, processed: extractAssetDefinitions(processed) ? `[ASSET DEFINITIONS]\n${extractAssetDefinitions(processed)}\n[END ASSET DEFINITIONS]\n\n${e.target.value}` : e.target.value })} className={`w-full h-full p-6 font-mono text-[13px] bg-transparent outline-none resize-none leading-relaxed text-[var(--ui-text-primary)] ${scriptMode === 'user' ? 'pt-14' : ''}`} placeholder="บทที่ประมวลผลเสร็จจะแสดงที่นี่..." />
+              </div>
+            )}
+            {activeTab === 'assets' && (
+              <div className={`w-full h-full p-6 overflow-y-auto ${!extractAssetDefinitions(processed) ? 'opacity-30' : ''}`}>
+                {!extractAssetDefinitions(processed) ? <div className="flex flex-col items-center justify-center h-full text-center"><span className="material-symbols-outlined text-5xl mb-3">database_off</span><p className="text-sm font-bold uppercase tracking-widest">ยังไม่ได้สร้างองค์ประกอบ</p></div> : (
+                  <div className="space-y-8">
+                    <div className="flex justify-between items-center border-b border-[var(--ui-border)] pb-2 mb-2"><h4 className="text-[10px] font-black uppercase tracking-[0.2em] text-[var(--ui-accent)]">ข้อมูลองค์ประกอบ</h4><button onClick={handleReExtractAssets} disabled={loading || stopping} className="flex items-center gap-1.5 px-3 py-1 bg-[var(--ui-accent)]/10 text-[var(--ui-accent)] rounded-lg text-[10px] font-black uppercase tracking-widest hover:bg-[var(--ui-accent)]/20 transition-all border border-[var(--ui-accent)]/30 disabled:opacity-30">{stopping ? 'กำลังหยุดงานเดิม...' : <><span className="material-symbols-outlined text-sm font-bold">refresh</span>ดึงตัวละครและฉากใหม่</>}</button></div>
+                    {Object.entries(assetData).map(([section, items]) => items.length > 0 && (
+                        <div key={section} className="space-y-3">
+                          <h4 className="text-[10px] font-black uppercase tracking-[0.2em] text-[var(--ui-text-muted)] pb-1">{section}</h4>
+                          <table className="w-full text-left text-[11px] font-medium border-collapse">
+                            <thead><tr className="text-[var(--ui-text-muted)] uppercase tracking-tighter"><th className="pb-2 pr-4 font-black">ID</th><th className="pb-2 pr-4 font-black">Name</th><th className="pb-2 font-black">Visual Prompt</th></tr></thead>
+                            <tbody className="divide-y divide-[var(--ui-border)]/40">
+                              {items.map((row, idx) => (<tr key={idx} className="group hover:bg-[var(--ui-surface-soft)]"><td className="py-2.5 pr-4 font-mono font-black text-[var(--ui-primary)]">{row[0]}</td><td className="py-2.5 pr-4 text-[var(--ui-text-primary)] font-bold">{row[1]}</td><td className="py-2.5 text-[var(--ui-text-muted)] italic leading-tight">{row[2]}</td></tr>))}
+                            </tbody>
+                          </table>
+                        </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+            <div className="absolute bottom-4 right-6 bg-[var(--ui-bg)]/80 backdrop-blur px-3 py-1.5 rounded-full border border-[var(--ui-border)] shadow-sm"><span className="text-[10px] font-black uppercase text-[var(--ui-text-muted)]">ได้ <span className="text-[var(--ui-accent)]">{sceneCount}</span> ฉาก จากที่ต้องการ <span className="text-[var(--ui-text-primary)]">{metrics.editedShots}</span> ฉาก</span></div>
+          </div>
+        </div>
+      </div>
+      {showHistory && (
+        <div className="fixed inset-0 z-[200] bg-black/90 backdrop-blur-md flex items-center justify-center p-6" onClick={() => setShowHistory(false)}>
+          <div className="bg-[var(--ui-surface)] border border-[var(--ui-border)] w-full max-w-lg rounded-2xl overflow-hidden shadow-2xl flex flex-col" onClick={e => e.stopPropagation()}>
+            <header className="p-5 border-b border-[var(--ui-border)] flex justify-between items-center bg-[var(--ui-surface-raised)]"><h3 className="text-sm font-black uppercase tracking-widest text-[var(--ui-text-primary)]">ประวัติเวอร์ชันบท (10 ล่าสุด)</h3><button onClick={() => setShowHistory(false)} className="material-symbols-outlined text-xl">close</button></header>
+            <div className="flex-1 overflow-y-auto max-h-[400px] divide-y divide-[var(--ui-border)]">
+              {history.map((item, i) => (
+                <div key={item.id} className="p-5 hover:bg-[var(--ui-surface-soft)] transition-colors flex items-center justify-between group">
+                  <div className="space-y-1"><p className="text-[11px] font-black text-[var(--ui-text-primary)] uppercase">{new Date(item.timestamp).toLocaleString('th-TH')}</p><p className="text-[10px] text-[var(--ui-text-muted)] font-bold uppercase tracking-tight">{item.sceneCount} ฉาก · {i === 0 ? 'เวอร์ชันปัจจุบัน' : `v.${history.length - i}`}</p></div>
+                  <button onClick={() => { onUpdate({ ...state.script, processed: item.content }); setShowHistory(false); }} className="px-4 py-2 bg-[var(--ui-accent)] text-black rounded-lg text-[10px] font-black uppercase tracking-widest hover:bg-[var(--ui-accent-hover)] transition-all">ใช้เวอร์ชันนี้</button>
+                </div>
+              ))}
+              {history.length === 0 && <div className="p-10 text-center text-[var(--ui-text-muted)] font-bold text-xs uppercase">ยังไม่มีประวัติการบันทึก</div>}
+            </div>
+          </div>
+        </div>
+      )}
+      <ConfirmDialog
+        open={showOverwriteConfirm}
+        icon="warning"
+        tone="warning"
+        title="มีบทเดิมอยู่แล้ว"
+        message="ต้องการสร้างบทใหม่ทับหรือไม่ — บทเดิมเรียกคืนได้จากปุ่ม ประวัติ"
+        confirmLabel="สร้างบทใหม่ทับ"
+        onConfirm={executeGeneration}
+        onCancel={() => setShowOverwriteConfirm(false)}
+      />
+      <div className="fixed bottom-0 left-0 lg:left-[280px] right-0 bg-[var(--ui-bg)]/90 backdrop-blur-2xl border-t border-[var(--ui-border)] p-6 flex justify-end items-center z-40"><NextStepButton onNext={onNext} missingRequirements={missingRequirements} className="px-12 py-3.5 bg-[var(--ui-accent)] text-black font-extrabold rounded-full shadow-2xl uppercase tracking-widest" /></div>
+    </div>
+  );
+};

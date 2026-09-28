@@ -1,0 +1,36 @@
+import { Asset, ConfigData } from '../types';
+export const castCode = (a: Asset) => `[${a.id.replace('@', '')}]`;
+const shortText = (t: string | undefined, n = 25) =>
+  (t || '').trim().split(/\s+/).slice(0, n).join(' ');
+export const identityText = (a: Asset) =>
+  a.type === 'Location'
+    ? (a.metadata?.spatialLock?.trim() || shortText(a.visualPrompt))
+    : (a.metadata?.identityLock?.trim() || shortText(a.visualPrompt));
+export const castLine = (a: Asset, refNo?: number) =>
+  `${castCode(a)} = ${a.name}${refNo ? ` (reference image ${refNo})` : ''}: ${identityText(a)}`;
+export function buildImageLockBlock(chars: Asset[], location: Asset | undefined, refIndex: Map<string, number>, config: ConfigData): string {
+  const parts: string[] = [];
+  if (chars.length) parts.push(`CAST: ${chars.map(c => castLine(c, refIndex.get(c.id))).join('; ')}.`);
+  if (location) parts.push(`LOCATION: ${castLine(location, refIndex.get(location.id))}.`);
+  if (chars.length) parts.push(`CHARACTER LOCK: each character must match their own reference image 1:1 — facial structure, eyes, eyebrows, nose, lips, jawline, cheekbones, skin tone, moles and unique marks, apparent age, hairstyle, hair color, hair length, body shape, height and proportions. Never blend or swap faces between characters; each code is always the same person in every shot. Only the listed characters appear as main subjects; any background extras stay small, distant and out of focus.`);
+  if (location) parts.push(`LOCATION LOCK: the place must match its reference image — same architecture, layout, materials, colors, furniture and fixed objects in the same positions. Do not add, remove or move major fixed elements. Only lighting, weather and time of day may follow the scene.`);
+  if (chars.length) parts.push(config.wardrobeMode === 'free'
+    ? `WARDROBE: face, hair, skin tone and body stay locked 100%; only clothing may change, exactly as the action describes.`
+    : `WARDROBE: every character wears exactly the outfit from their reference image. No outfit changes.`);
+  parts.push(`Codes in square brackets are labels only; never write them or any text in the image.`);
+  return parts.join(' ');
+}
+export function buildVideoLockBlock(chars: Asset[], location: Asset | undefined, config: ConfigData): string {
+  const parts: string[] = [];
+  if (chars.length) parts.push(`CAST: ${chars.map(c => castLine(c)).join('; ')}.`);
+  if (location) parts.push(`LOCATION: ${castLine(location)}.`);
+  parts.push(`LOCK: every face, hairstyle, skin tone, body${config.wardrobeMode === 'free' ? '' : ', outfit'} and the location stay exactly as in the first frame for the whole clip, including when characters turn their heads or move. Never blend or swap faces between characters. No new main characters appear.`);
+  return parts.join(' ');
+}
+const NEG_BASE = ['face swap', 'face blending', 'identity drift', 'wrong character', 'duplicate person', 'deformed face', 'distorted features', 'blurry face', 'hairstyle change', 'inconsistent hair', 'skin tone change', 'changed architecture', 'moved furniture', 'different room layout', 'text labels', 'character codes'];
+const NEG_OUTFIT = ['outfit change', 'inconsistent outfit'];
+export const identityNegative = (config: ConfigData) =>
+  [...NEG_BASE, ...(config.wardrobeMode === 'free' ? [] : NEG_OUTFIT)].join(', ');
+export const identityRequestPrompt = (a: Asset) => a.type === 'Location'
+  ? `From this location description, write ONE short line (max 30 words) of the permanent features that identify this place: architecture, layout, main materials and colors, fixed furniture and key objects with their positions. Do not describe lighting, time of day, weather, people or art style. Output only the line.\nDescription: ${a.visualPrompt || a.name}`
+  : `From this character description, write ONE short line (max 30 words) of the permanent identity features that make this person different from everyone else: gender and age, face shape, eyes, eyebrows, skin tone, moles or marks, hairstyle, hair color and length, build. Do not describe clothing, pose, background, lighting or art style. Output only the line.\nDescription: ${a.visualPrompt || a.name}`;

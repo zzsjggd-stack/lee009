@@ -1,0 +1,163 @@
+import React, { useState, useMemo, useEffect } from 'react';
+import { useQueue } from '../hooks/useQueue';
+import { friendlyError } from '../lib/friendlyError';
+import { ErrorDetails } from './ErrorDetails';
+const COLLAPSED_STORAGE_KEY = 'g2_queue_collapsed';
+const VISIBLE_STORAGE_KEY = 'g2_queue_visible';
+const STATUS_LABELS: Record<string, string> = {
+  waiting: 'รอคิว',
+  starting: 'กำลังเริ่ม',
+  running: 'กำลังสร้าง',
+  completed: 'เสร็จ',
+  failed: 'ล้มเหลว'
+};
+export const QueuePanel: React.FC = () => {
+  const { queue, cancelAll, retryFailed, clearCompleted, pauseQueue, resumeQueue, pauseUntil, retryJob, removeJob } = useQueue();
+  const [isCollapsed, setIsCollapsed] = useState(() => localStorage.getItem(COLLAPSED_STORAGE_KEY) === 'true');
+  const [isVisible, setIsVisible] = useState(() => localStorage.getItem(VISIBLE_STORAGE_KEY) !== 'false');
+  const [countdown, setCountdown] = useState(0);
+  useEffect(() => {
+    localStorage.setItem(COLLAPSED_STORAGE_KEY, isCollapsed.toString());
+  }, [isCollapsed]);
+  useEffect(() => {
+    localStorage.setItem(VISIBLE_STORAGE_KEY, isVisible.toString());
+  }, [isVisible]);
+  useEffect(() => {
+    let timer: number;
+    if (pauseUntil && pauseUntil > Date.now()) {
+      timer = window.setInterval(() => {
+        const remaining = Math.max(0, Math.ceil((pauseUntil - Date.now()) / 1000));
+        setCountdown(remaining);
+        if (remaining <= 0) clearInterval(timer);
+      }, 1000);
+    } else {
+      setCountdown(0);
+    }
+    return () => clearInterval(timer);
+  }, [pauseUntil]);
+  const stats = useMemo(() => {
+    const total = queue.jobs.length;
+    const completed = queue.jobs.filter(j => j.status === 'completed').length;
+    const running = queue.jobs.filter(j => j.status === 'starting' || j.status === 'running').length;
+    const waiting = queue.jobs.filter(j => j.status === 'waiting').length;
+    const failed = queue.jobs.filter(j => j.status === 'failed').length;
+    const progress = total > 0 ? (completed / total) * 100 : 0;
+    return { running, waiting, completed, failed, total, progress };
+  }, [queue.jobs]);
+  if (queue.jobs.length === 0) return null;
+  if (!isVisible) {
+    return (
+      <button 
+        onClick={(e) => { e.stopPropagation(); setIsVisible(true); }}
+        title="เปิดแผงคิวงาน"
+        className="fixed bottom-[100px] right-6 z-[60] h-11 px-4 bg-[var(--ui-primary)] text-white rounded-full shadow-2xl flex items-center gap-2 hover:scale-105 active:scale-95 transition-all cursor-pointer border border-white/10"
+      >
+        <span className="material-symbols-outlined font-bold text-xl">queue</span>
+        <span className="text-[12px] font-bold whitespace-nowrap">คิว {stats.completed}/{stats.total}</span>
+        {stats.failed > 0 && <span className="text-[11px] font-black bg-red-500 text-white rounded-full px-1.5">{stats.failed}</span>}
+        {(stats.running > 0 || countdown > 0) && (
+          <span className={`absolute -top-0.5 -right-0.5 w-3 h-3 ${countdown > 0 ? 'bg-amber-500' : 'bg-[var(--ui-accent)]'} rounded-full animate-ping border-2 border-[var(--ui-bg)]`} />
+        )}
+      </button>
+    );
+  }
+  return (
+    <div className={`fixed bottom-[100px] right-6 z-[60] border border-[var(--ui-border-strong)] rounded-2xl shadow-[0_20px_60px_rgba(0,0,0,0.8)] transition-all duration-300 ease-in-out flex flex-col overflow-hidden bg-[var(--ui-surface-raised)]/90 backdrop-blur-xl ${isCollapsed ? 'w-[200px] h-[44px]' : 'w-[380px] h-[60vh] max-h-[60%]'}`}>
+      <div className={`shrink-0 flex items-center justify-between border-b border-[var(--ui-border)] bg-[var(--ui-surface-raised)]/50 ${isCollapsed ? 'h-[44px] px-3' : 'h-14 px-5'}`}>
+        <div className="flex items-center gap-2 overflow-hidden flex-1">
+          <div className={`shrink-0 w-1.5 h-1.5 rounded-full ${countdown > 0 ? 'bg-amber-500 animate-pulse' : stats.running > 0 ? 'bg-[var(--ui-accent)] animate-pulse' : 'bg-slate-600'}`} />
+          <span className="text-[12px] font-extrabold uppercase tracking-widest text-[var(--ui-text-primary)] truncate">
+            {isCollapsed ? `คิว ${stats.completed}/${stats.total}` : 'คิวงาน'}
+          </span>
+        </div>
+        
+        <div className="flex items-center gap-0.5">
+          <button onClick={() => setIsCollapsed(!isCollapsed)} className="w-8 h-8 flex items-center justify-center text-[var(--ui-text-muted)] hover:text-[var(--ui-text-primary)] transition-colors rounded-lg">
+            <span className="material-symbols-outlined text-xl transition-transform" style={{ transform: isCollapsed ? 'rotate(180deg)' : 'rotate(0deg)' }}>keyboard_arrow_down</span>
+          </button>
+          <button onClick={() => setIsVisible(false)} className="w-8 h-8 flex items-center justify-center text-[var(--ui-text-muted)] hover:text-[var(--ui-danger)] transition-colors rounded-lg">
+            <span className="material-symbols-outlined text-xl">close</span>
+          </button>
+        </div>
+      </div>
+      {!isCollapsed && (
+        <>
+          {countdown > 0 && (
+            <div className="bg-amber-500 px-5 py-2 flex items-center gap-2 animate-in slide-in-from-top-1">
+              <span className="material-symbols-outlined text-black text-lg font-bold">timer</span>
+              <span className="text-black font-black text-[11px] uppercase tracking-tight">พักคิว {countdown} วินาที — โดนจำกัดการใช้งาน</span>
+            </div>
+          )}
+          <div className="shrink-0 px-5 py-3 border-b border-[var(--ui-border)] space-y-2">
+            <div className="flex items-center justify-between font-bold text-[var(--ui-text-muted)]" style={{ fontSize: 'var(--fs-micro)' }}>
+              <span className="text-[var(--ui-success)]">เสร็จ {stats.completed}</span>
+              <span>กำลังสร้าง {stats.running}</span>
+              <span>รอคิว {stats.waiting}</span>
+              <span className={stats.failed > 0 ? 'text-[var(--ui-danger)]' : ''}>ล้มเหลว {stats.failed}</span>
+            </div>
+            <div className="h-1.5 w-full bg-black/30 rounded-full overflow-hidden">
+              <div className="h-full bg-[var(--ui-success)] transition-all duration-500" style={{ width: `${stats.progress}%` }} />
+            </div>
+          </div>
+          <div className="flex-1 overflow-y-auto p-5 space-y-4 custom-scrollbar">
+            {queue.jobs.filter(j => j.status !== 'completed').map(job => (
+              <div key={job.id} className="bg-[var(--ui-surface-soft)] border border-[var(--ui-border)] p-4 rounded-xl space-y-3">
+                <div className="flex justify-between items-start">
+                   <span className="text-[13px] font-extrabold text-[var(--ui-text-primary)] truncate mr-2">{job.label}</span>
+                   <span className={`text-[9px] font-black uppercase px-2 py-0.5 rounded border ${
+                     (job.status === 'running' || job.status === 'starting') ? 'bg-amber-500/10 text-amber-500 border-amber-500/20' : 
+                     job.status === 'failed' ? 'bg-red-500/10 text-red-500 border-red-500/20' : 'text-[var(--ui-text-muted)] border-[var(--ui-border)]'
+                   }`}>
+                     {STATUS_LABELS[job.status] || job.status}
+                   </span>
+                </div>
+                {(job.status === 'running' || job.status === 'starting') && (
+                  <div className="space-y-1.5">
+                    <div className="h-1 w-full bg-black/40 rounded-full overflow-hidden">
+                      <div className="h-full bg-[var(--ui-accent)] transition-all duration-500" style={{ width: `${Math.max(job.progress, 10)}%` }} />
+                    </div>
+                    <p className="text-[9px] text-[var(--ui-accent)] font-bold text-center">กำลังสร้าง (ยกเลิกไม่ได้)</p>
+                  </div>
+                )}
+                {job.status === 'failed' && (
+                  <div className="space-y-2">
+                    <ErrorDetails raw={job.error} className="text-[var(--ui-danger)]" />
+                    <div className="flex gap-2">
+                      <button onClick={() => retryJob(job.id)} className="flex-1 py-2 bg-[var(--ui-accent)]/10 text-[var(--ui-accent)] border border-[var(--ui-accent)]/30 rounded-lg text-[11px] font-bold active:scale-95">ลองใหม่</button>
+                      <button onClick={() => removeJob(job.id)} className="px-3 py-2 bg-[var(--ui-surface-raised)] text-[var(--ui-text-muted)] border border-[var(--ui-border)] rounded-lg text-[11px] font-bold active:scale-95">ทิ้ง</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            ))}
+            
+            {queue.jobs.filter(j => j.status !== 'completed').length === 0 && stats.total > 0 && (
+              <div className="py-10 text-center opacity-30 flex flex-col items-center gap-2">
+                <span className="material-symbols-outlined text-4xl block">task_alt</span>
+                <p className="text-[10px] font-bold uppercase tracking-widest">ดำเนินการครบแล้ว</p>
+              </div>
+            )}
+          </div>
+          <div className="shrink-0 p-5 border-t border-[var(--ui-border)] bg-[var(--ui-surface-raised)]/50 space-y-2">
+             <div className="flex gap-2">
+                <button onClick={queue.isPaused ? resumeQueue : pauseQueue} className="flex-1 py-3 bg-[var(--ui-surface-soft)] text-[var(--ui-text-primary)] font-bold rounded-xl text-[11px] border border-[var(--ui-border)] active:scale-95">
+                  {queue.isPaused ? 'ทำงานต่อ' : 'หยุดคิว'}
+                </button>
+                <button onClick={cancelAll} disabled={stats.waiting === 0} className="flex-1 py-3 bg-[var(--ui-danger)]/10 text-[var(--ui-danger)] font-bold rounded-xl text-[11px] border border-[var(--ui-danger)]/20 active:scale-95 disabled:opacity-20">
+                  ยกเลิกที่รอคิว ({stats.waiting})
+                </button>
+             </div>
+             <div className="flex gap-2">
+                <button onClick={retryFailed} disabled={stats.failed === 0} className={`flex-1 py-2.5 font-bold rounded-xl text-[11px] border active:scale-95 disabled:opacity-20 ${stats.failed > 0 ? 'bg-[var(--ui-accent)] text-black border-[var(--ui-accent)]' : 'bg-[var(--ui-accent)]/10 text-[var(--ui-accent)] border-[var(--ui-accent)]/20'}`}>
+                  ลองใหม่ทั้งหมด ({stats.failed})
+                </button>
+                <button onClick={clearCompleted} disabled={stats.completed === 0} className="flex-1 py-2.5 bg-[var(--ui-surface-soft)] text-[var(--ui-text-muted)] font-bold rounded-xl text-[11px] border border-[var(--ui-border)] active:scale-95 disabled:opacity-20">
+                  ล้างที่เสร็จ ({stats.completed})
+                </button>
+             </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+};

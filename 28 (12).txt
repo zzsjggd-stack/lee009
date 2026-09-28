@@ -1,0 +1,163 @@
+import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
+import { Flow } from 'flow-sdk';
+import { Job, JobType, QueueState, ConfigData } from '../types';
+interface QueueContextType {
+  queue: QueueState;
+  pauseUntil: number | null;
+  addJobs: (jobs: Job[]) => void;
+  pauseQueue: () => void;
+  resumeQueue: () => void;
+  cancelAll: () => void;
+  retryFailed: () => void;
+  retryJob: (id: string) => void;
+  removeJob: (id: string) => void;
+  clearCompleted: () => void;
+}
+const QueueContext = createContext<QueueContextType | undefined>(undefined);
+export const QueueProvider: React.FC<{ children: React.ReactNode; config: ConfigData }> = ({ children, config }) => {
+  const [queue, setQueue] = useState<QueueState>({
+    jobs: [],
+    isPaused: false,
+    totalCreditsSpent: 0,
+  });
+  const [pauseUntil, setPauseUntil] = useState<number | null>(null);
+  const queueRef = useRef(queue);
+  queueRef.current = queue;
+  const pauseUntilRef = useRef(pauseUntil);
+  pauseUntilRef.current = pauseUntil;
+  const addJobs = (newJobs: Job[]) => {
+    setQueue(prev => ({
+      ...prev,
+      jobs: [...prev.jobs, ...newJobs],
+    }));
+  };
+  const pauseQueue = () => setQueue(prev => ({ ...prev, isPaused: true }));
+  const resumeQueue = () => setQueue(prev => ({ ...prev, isPaused: false }));
+  
+  const cancelAll = () => {
+    setQueue(prev => ({
+      ...prev,
+      jobs: prev.jobs.map(j => (j.status === 'waiting') ? { ...j, status: 'failed', error: 'ยกเลิกโดยผู้ใช้' } as Job : j),
+      isPaused: false
+    }));
+  };
+  const retryFailed = () => {
+    setQueue(prev => ({
+      ...prev,
+      jobs: prev.jobs.map(j => j.status === 'failed' ? { ...j, status: 'waiting', retryCount: 0, error: undefined, rateLimitCount: 0 } as Job : j),
+      isPaused: false
+    }));
+  };
+  const retryJob = (id: string) => {
+    setQueue(prev => ({
+      ...prev,
+      jobs: prev.jobs.map(j => j.id === id && j.status === 'failed' ? { ...j, status: 'waiting', retryCount: 0, error: undefined, startTime: undefined, rateLimitCount: 0 } as Job : j),
+      isPaused: false
+    }));
+  };
+  const removeJob = (id: string) => {
+    setQueue(prev => ({ ...prev, jobs: prev.jobs.filter(j => j.id !== id) }));
+  };
+  const clearCompleted = () => {
+    setQueue(prev => ({
+      ...prev,
+      jobs: prev.jobs.filter(j => j.status !== 'completed'),
+    }));
+  };
+  useEffect(() => {
+    const timer = setInterval(async () => {
+      const { jobs, isPaused } = queueRef.current;
+      if (isPaused) return;
+      if (pauseUntilRef.current && Date.now() < pauseUntilRef.current) {
+        return;
+      }
+      const activeJobs = jobs.filter(j => j.status === 'starting' || j.status === 'running');
+      const waitingJobs = jobs.filter(j => j.status === 'waiting');
+      if (waitingJobs.length === 0) return;
+      if (activeJobs.length >= config.maxConcurrentJobs) return;
+      const lastStartedJob = [...jobs].reverse().find(j => j.status === 'starting' || j.status === 'running' || (j.status === 'completed' || j.status === 'failed') && j.startTime);
+      const now = Date.now();
+      
+      if (lastStartedJob && lastStartedJob.startTime) {
+        const elapsedSinceLastStart = (now - lastStartedJob.startTime) / 1000;
+        if (elapsedSinceLastStart < config.staggerDelaySeconds) return;
+      }
+      const nextJob = waitingJobs[0];
+      startJob(nextJob.id);
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [config.maxConcurrentJobs, config.staggerDelaySeconds]);
+  const startJob = async (jobId: string) => {
+    updateJob(jobId, { status: 'starting', startTime: Date.now(), progress: 0 });
+    const job = queueRef.current.jobs.find(j => j.id === jobId);
+    if (!job) return;
+    try {
+      updateJob(jobId, { status: 'running', progress: 10 });
+      let result;
+      const TIMEOUT_MS = job.type === 'image' ? 10 * 60 * 1000 : 30 * 60 * 1000;
+      const call = job.type === 'image' ? Flow.generate.image(job.payload) : Flow.generate.video(job.payload);
+      let timer: any;
+      const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('TIMEOUT')), TIMEOUT_MS); });
+      try {
+        result = await Promise.race([call, timeout]);
+      } finally {
+        clearTimeout(timer);
+      }
+      updateJob(jobId, { status: 'completed', progress: 100 });
+      setQueue(prev => ({ ...prev, totalCreditsSpent: prev.totalCreditsSpent + job.credits }));
+      window.dispatchEvent(new CustomEvent('QUEUE_JOB_COMPLETED', { 
+        detail: { jobId, type: job.type, result, originalPayload: job.payload } 
+      }));
+    } catch (err: any) {
+      const errorMsg = err.message || err.toString();
+      const lowerError = errorMsg.toLowerCase();
+      
+      const isRateLimit = lowerError.includes('429') || lowerError.includes('quota') || lowerError.includes('rate limit');
+      if (isRateLimit) {
+        const n = job.rateLimitCount || 0;
+        if (n >= 5) {
+          const msg = 'ถูกจำกัดการใช้งานติดกัน 5 รอบ (เครดิตหรือโควตาอาจหมด) — รอสักพักแล้วกดลองใหม่';
+          updateJob(jobId, { status: 'failed', error: msg });
+          window.dispatchEvent(new CustomEvent('QUEUE_JOB_FAILED', { detail: { jobId, error: msg } }));
+          return;
+        }
+        setPauseUntil(Date.now() + Math.min(30000 * (n + 1), 120000));
+        updateJob(jobId, { status: 'waiting', error: undefined, startTime: undefined, rateLimitCount: n + 1 });
+        return;
+      }
+      if (errorMsg === 'TIMEOUT') {
+        updateJob(jobId, { status: 'failed', error: 'TIMEOUT' });
+        window.dispatchEvent(new CustomEvent('QUEUE_JOB_FAILED', { detail: { jobId, error: 'TIMEOUT' } }));
+        return;
+      }
+      const currentRetry = job.retryCount;
+      if (currentRetry < 2) {
+        updateJob(jobId, { status: 'failed', error: `ล้มเหลว กำลังลองใหม่ (${currentRetry + 1}/2)` });
+        setTimeout(() => {
+          updateJob(jobId, { status: 'waiting', retryCount: currentRetry + 1, error: undefined });
+        }, 2000);
+      } else {
+        updateJob(jobId, { status: 'failed', error: errorMsg });
+        window.dispatchEvent(new CustomEvent('QUEUE_JOB_FAILED', { 
+          detail: { jobId, error: errorMsg } 
+        }));
+      }
+    }
+  };
+  const updateJob = (id: string, updates: Partial<Job>) => {
+    setQueue(prev => ({
+      ...prev,
+      jobs: prev.jobs.map(j => j.id === id ? { ...j, ...updates } : j)
+    }));
+  };
+  return (
+    <QueueContext.Provider value={{ queue, pauseUntil, addJobs, pauseQueue, resumeQueue, cancelAll, retryFailed, retryJob, removeJob, clearCompleted }}>
+      {children}
+    </QueueContext.Provider>
+  );
+};
+export const useQueue = () => {
+  const context = useContext(QueueContext);
+  if (!context) throw new Error('useQueue must be used within QueueProvider');
+  return context;
+};

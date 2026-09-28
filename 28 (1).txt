@@ -1,0 +1,440 @@
+// ชื่อเครื่องมือคือ "G2" เท่านั้น ห้ามเปลี่ยนชื่อ ห้ามเติมคำต่อท้าย ทั้งในโค้ด คอมเมนต์ และข้อความบนจอ
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { Sidebar } from './components/Sidebar';
+import { Step1Script } from './components/Step1Script';
+import { VisualEffects } from './components/VisualEffects';
+import { QueuePanel } from './components/QueuePanel';
+import { QueueProvider } from './hooks/useQueue';
+import { AppState, ConfigData, VideoItem, ScriptData } from './types';
+import { sanitizeStateForStorage, safeSessionSave } from './lib/storage';
+import { bundleProjectZip, resolveMedia } from './lib/download';
+import { loadUIPreferences, UIPreferences, CARD_MIN_WIDTH } from './lib/uiPreferences';
+import { stepLabel } from './lib/steps';
+import { friendlyError } from './lib/friendlyError';
+import { STYLES_PROMPT } from './lib/constants';
+const Step2Config = React.lazy(() => import('./components/Step2Config').then(m => ({ default: m.Step2Config })));
+const Step3Assets = React.lazy(() => import('./components/Step3Assets').then(m => ({ default: m.Step3Assets })));
+const Step4Storyboard = React.lazy(() => import('./components/Step4Storyboard').then(m => ({ default: m.Step4Storyboard })));
+const Step5Video = React.lazy(() => import('./components/Step5Video').then(m => ({ default: m.Step5Video })));
+const Step6Export = React.lazy(() => import('./components/Step6Export').then(m => ({ default: m.Step6Export })));
+const UISettingsPanel = React.lazy(() => import('./components/UISettingsPanel').then(m => ({ default: m.UISettingsPanel })));
+const STORAGE_KEY = 'g2_storyboard_director_autosave';
+export const DEFAULT_NEGATIVE = "no text, no letters, no numbers, no labels, no captions, no subtitles, no watermarks, no logos, no borders, no frames, no split screen, no collage, no grid, no vignette edges, no cartoon, no anime, no illustration, no painting, no sketch, no 3D render, no extra fingers, no deformed hands, no distorted faces, no morphing faces, no extra limbs, no duplicate person, no inconsistent character features, no warped backgrounds, no floating objects, no plastic skin, no flat lighting, no uncanny valley, no soap opera effect, no oversaturated colors, no low quality, no blurry";
+const INITIAL_STATE: AppState = {
+  script: {
+    original: '',
+    processed: '',
+    genre: 'ละครสั้นแนวตั้ง (พลิกกลับ)',
+    durationSeconds: 300,
+    durationRaw: '5',
+    language: 'ไทย',
+    spokenLanguage: 'อัตโนมัติตามโลกของเรื่อง',
+    customSpokenLanguage: '',
+    sceneCeiling: 'auto',
+    setting: 'ไทยร่วมสมัย',
+    customSetting: '',
+    extraNotes: '',
+  },
+  config: {
+    aspectRatio: '9:16',
+    colorTone: 'Milk Tea Haze',
+    negativePrompt: DEFAULT_NEGATIVE,
+    projectNotes: '',
+    style: 'Cinematic Live Action',
+    maxScenes: 120,
+    imageModel: '🍌 Nano Banana Pro',
+    videoModel: 'Veo 3.1 - Lite [Lower Priority]',
+    textModel: 'medium',
+    videoDuration: 8,
+    batchCount: 1,
+    isTestMode: false,
+    maxConcurrentJobs: 4,
+    staggerDelaySeconds: 3,
+    durationMode: 'auto',
+    wardrobeMode: 'locked',
+    limitThreeCast: true,
+  },
+  assets: [],
+  storyboard: [],
+  videos: [],
+  downloadedMediaIds: [],
+};
+const normalizeStyle = (config: ConfigData): ConfigData => {
+  const s = config?.style;
+  if (!s || s === 'Custom' || s in STYLES_PROMPT) return config;
+  const inner = s.match(/\(([^)]+)\)\s*$/)?.[1]?.trim();
+  return inner && inner in STYLES_PROMPT ? { ...config, style: inner } : config;
+};
+export default function App() {
+  const [currentStep, setCurrentStep] = useState(1);
+  const [state, setState] = useState<AppState>(INITIAL_STATE);
+  const [isLoaded, setIsLoaded] = useState(false);
+  const [uiPrefs, setUiPrefs] = useState<UIPreferences>(loadUIPreferences());
+  const [showSettings, setShowSettings] = useState(false);
+  const [importStatus, setImportStatus] = useState('');
+  const [autosaveFailed, setAutosaveFailed] = useState(false);
+  const [zipProgress, setZipProgress] = useState<string | null>(null);
+  const handleSidebarExport = async () => {
+    if (zipProgress) return;
+    setZipProgress('กำลังเตรียมไฟล์...');
+    try {
+      const report = await bundleProjectZip(state, (t: string) => setZipProgress(t));
+      const notes: string[] = [];
+      if (report.skippedVideos.length) notes.push(`ไม่ได้ใส่วิดีโอ ${report.skippedVideos.length} คลิป เพราะไฟล์ใหญ่เกิน — วิดีโอยังอยู่ในคลัง Flow และโหลดแยกได้ที่ STEP 6 เมนู "โหลดเฉพาะวิดีโอทั้งหมด"`);
+      if (report.failedFiles.length) notes.push(`ดึงไฟล์ไม่ได้ ${report.failedFiles.length} ไฟล์: ${report.failedFiles.join(', ')}`);
+      if (notes.length) alert('บันทึกแล้ว แต่\n' + notes.join('\n'));
+    } catch (err) {
+      alert('บันทึกไม่สำเร็จ: ' + (err instanceof Error ? err.message : String(err)));
+    } finally {
+      setZipProgress(null);
+    }
+  };
+  useEffect(() => {
+    const onFail = () => setAutosaveFailed(true);
+    window.addEventListener('G2_AUTOSAVE_FAILED', onFail);
+    return () => window.removeEventListener('G2_AUTOSAVE_FAILED', onFail);
+  }, []);
+  useEffect(() => {
+    const saved = sessionStorage.getItem(STORAGE_KEY);
+    let baseState = INITIAL_STATE;
+    if (saved) {
+      try {
+        const parsedSaved = JSON.parse(saved);
+        if (parsedSaved && typeof parsedSaved === 'object') {
+          const loadedState = { 
+            ...baseState, 
+            ...parsedSaved,
+            assets: Array.isArray(parsedSaved.assets) ? parsedSaved.assets : baseState.assets,
+            storyboard: Array.isArray(parsedSaved.storyboard) ? parsedSaved.storyboard : baseState.storyboard,
+            videos: Array.isArray(parsedSaved.videos) ? parsedSaved.videos : baseState.videos,
+            script: { ...baseState.script, ...parsedSaved.script },
+            config: { ...baseState.config, ...parsedSaved.config }
+          };
+          setState(loadedState);
+        }
+      } catch (e) {
+        console.error('Failed to load save state', e);
+        setState(baseState);
+      }
+    } else {
+      setState(baseState);
+    }
+    setIsLoaded(true);
+    const style = document.createElement('style');
+    style.id = 'g2-global-styles';
+    style.innerHTML = `
+      @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Noto+Sans+Thai:wght@400;500;600;700;800&display=swap');
+      :root {
+        --ui-bg: #080B12; --ui-sidebar: #0B0F18; --ui-surface: #101521; --ui-surface-raised: #151B29; --ui-surface-soft: #1A2132; --ui-input: #0A0E17;
+        --ui-border: #222A3B; --ui-border-hover: #2F3950; --ui-border-strong: #2F3950;
+        --ui-text-primary: #F2F5FB; --ui-text-secondary: #C3CBDA; --ui-text-muted: #8691A8;
+        --ui-primary: #2F6BF0; --ui-primary-hover: #4F84FF; --ui-on-primary: #FFFFFF;
+        --ui-accent: #5CC8FF; --ui-accent-hover: #8AD8FF; --ui-info: #A5B4FC; --ui-success: #34D399; --ui-danger: #EF4444;
+        --ui-gradient: linear-gradient(135deg, #3050E8 0%, #3478FF 50%, #1A9BD7 100%);
+        --ui-glass: transparent; --ui-glass-blur: 0px;
+        --fs-h1: clamp(29px, 1.9vw, 34px); --fs-h2: clamp(20px, 1.4vw, 24px); --fs-lead: 15px; --fs-label: 13px; --fs-body: 15px; --fs-small: 13px; --fs-micro: 11px;
+        --lh-tight: 1.25; --lh-body: 1.55; --ui-page-pad: 28px; --ui-gap: 28px; --ui-panel-pad: 28px; --ui-control-height: 48px; --ui-card-gap: 24px; --ui-card-pad: 20px;
+      }
+      [data-ui-theme="light"] { 
+        --ui-bg: #f4f6f8; --ui-sidebar: #ffffff; --ui-surface: #ffffff; --ui-surface-raised: #ffffff; --ui-surface-soft: #f1f3f6; --ui-input: #f8fafc; --ui-border: #d9dee7; --ui-border-hover: #c7ced8; --ui-border-strong: #c7ced8; --ui-text-primary: #111827; --ui-text-secondary: #374151; --ui-text-muted: #6b7280; 
+        --ui-primary: #2457D6; --ui-primary-hover: #1E48B8; --ui-on-primary: #FFFFFF; --ui-accent: #0284C7; --ui-accent-hover: #0369A1; --ui-info: #6366F1; 
+      }
+      [data-ui-text-size="small"] { --fs-h1: clamp(26px, 1.7vw, 30px); --fs-h2: clamp(19px, 1.3vw, 22px); --fs-lead: 13px; --fs-label: 11px; --fs-body: 13px; --fs-small: 11px; --fs-micro: 10px; }
+      [data-ui-text-size="medium"] { --fs-h1: clamp(29px, 1.9vw, 34px); --fs-h2: clamp(20px, 1.4vw, 24px); --fs-lead: 15px; --fs-label: 13px; --fs-body: 15px; --fs-small: 13px; --fs-micro: 11px; }
+      [data-ui-text-size="large"] { --fs-h1: clamp(32px, 2.1vw, 38px); --fs-h2: clamp(22px, 1.5vw, 26px); --fs-lead: 17px; --fs-label: 14px; --fs-body: 17px; --fs-small: 14px; --fs-micro: 12px; }
+      [data-ui-density="compact"] { --ui-page-pad: 20px; --ui-gap: 20px; --ui-panel-pad: 20px; --ui-control-height: 40px; }
+      [data-ui-density="comfortable"] { --ui-page-pad: 36px; --ui-gap: 36px; --ui-panel-pad: 32px; --ui-control-height: 54px; }
+      body { font-family: "Plus Jakarta Sans", "Noto Sans Thai", system-ui, -apple-system, sans-serif; -webkit-font-smoothing: antialiased; letter-spacing: -0.01em; }
+      /* ภาษาไทยห้ามถ่างระยะตัวอักษร */
+      [lang="th"], .font-thai { letter-spacing: 0 !important; }
+      .tracking-thai-tight { letter-spacing: -0.015em; }
+      input, select, textarea { font-family: inherit; }
+      * { transition-property: background-color, border-color, color, fill, stroke; transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1); transition-duration: 150ms; }
+      /* ขนาดตัวอักษรตามการตั้งค่า เล็ก/กลาง/ใหญ่ */
+      [class~="text-[8px]"], [class~="text-[9px]"], [class~="text-[10px]"], [class~="text-[11px]"],
+      [style*="font-size: 8px"], [style*="font-size: 9px"], [style*="font-size: 10px"], [style*="font-size: 11px"] {
+        font-size: var(--fs-micro) !important;
+      }
+      [class~="text-xs"], [class~="text-[12px]"], [style*="font-size: 12px"] {
+        font-size: calc(var(--fs-micro) + 1px) !important;
+      }
+      [class~="text-[13px]"], [style*="font-size: 13px"] {
+        font-size: var(--fs-small) !important;
+      }
+      [class~="text-sm"] {
+        font-size: calc(var(--fs-small) + 1px) !important;
+      }
+      /* ไม่ให้คลุมดำและไม่ขึ้นเคอร์เซอร์ข้อความ ยกเว้นช่องพิมพ์ */
+      body {
+        -webkit-user-select: none;
+        user-select: none;
+        cursor: default;
+      }
+      input, textarea, select, [contenteditable="true"] {
+        -webkit-user-select: text;
+        user-select: text;
+        cursor: auto;
+      }
+      button, a, label, select, [role="button"] { cursor: pointer; }
+      button:disabled { cursor: default; }
+      /* ตัวหนังสือบนพื้นสีหลัก ใช้สีเข้มให้อ่านออก */
+      [class~="bg-[var(--ui-primary)]"][class~="text-white"],
+      [class~="bg-[var(--ui-primary)]"] [class~="text-white"] {
+        color: var(--ui-on-primary) !important;
+      }
+      /* คลาสสำหรับปุ่มเน้นพิเศษ G2 CTA */
+      .g2-cta { background: var(--ui-gradient) !important; color: #FFFFFF !important; border-color: transparent !important; box-shadow: 0 8px 24px -10px rgba(47, 107, 240, 0.65); }
+      .g2-cta:hover:not(:disabled):not([aria-disabled="true"]) { filter: brightness(1.1); }
+    `;
+    document.head.appendChild(style);
+    return () => { document.head.removeChild(style); };
+  }, []);
+  useEffect(() => {
+    if (!isLoaded) return;
+    const timer = setInterval(() => {
+      const sanitized = sanitizeStateForStorage(state);
+      safeSessionSave(STORAGE_KEY, sanitized);
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [state, isLoaded]);
+  const patchState = useCallback((patch: Partial<AppState> | ((prev: AppState) => Partial<AppState>)) => {
+    setState(prev => {
+      const actualPatch = typeof patch === 'function' ? patch(prev) : patch;
+      return { ...prev, ...actualPatch };
+    });
+  }, []);
+  const handleScriptUpdate = useCallback((script: ScriptData) => patchState({ script }), [patchState]);
+  const handleConfigUpdate = useCallback((config: ConfigData) => patchState({ config }), [patchState]);
+  // รับผลงานจากคิวทุกหน้า ที่นี่ที่เดียว
+  useEffect(() => {
+    const onDone = (e: any) => {
+      const { jobId, result, originalPayload } = e.detail || {};
+      if (!jobId || !result) return;
+      const id = String(jobId).split('_')[1];
+      if (!id) return;
+      if (jobId.startsWith('asset_')) {
+        patchState(prev => ({
+          assets: (prev.assets || []).map(a => a.id === id ? {
+            ...a, status: 'READY', referenceBase64: result.base64, referenceMediaId: result.mediaId,
+            referenceMimeType: result.mimeType, imageVisualPrompt: a.visualPrompt, generationError: undefined,
+            imageKey: a.pendingImageKey ?? a.imageKey, pendingImageKey: undefined
+          } : a)
+        }));
+      }
+      if (jobId.startsWith('shot_')) {
+        patchState(prev => ({
+          storyboard: (prev.storyboard || []).map(s => s.id === id ? {
+            ...s, firstFrameMediaId: result.mediaId, firstFrameBase64: result.base64,
+            frameAspectRatio: originalPayload?.aspectRatio,
+            frameSourceKey: s.pendingFrameKey ?? s.frameSourceKey, pendingFrameKey: undefined,
+            frameRefIds: s.pendingRefIds ?? s.frameRefIds, pendingRefIds: undefined,
+            frameError: undefined
+          } : s)
+        }));
+      }
+      if (jobId.startsWith('vid_')) {
+        patchState(prev => {
+          const shot = (prev.storyboard || []).find(s => s.id === id);
+          const item: VideoItem = {
+            id: `vid-item-${Date.now()}-${Math.random()}`,
+            shotId: id,
+            videoMediaId: result.mediaId,
+            videoBase64: result.base64,
+            mimeType: result.mimeType,
+            aspectRatio: originalPayload?.aspectRatio,
+            sourceFrameMediaId: originalPayload?.firstFrameImageMediaId,
+            durationSeconds: originalPayload?.durationSeconds,
+            sourceKey: shot?.pendingVideoKey
+          };
+          return {
+            videos: [...(prev.videos || []).filter(v => v.shotId !== id), item],
+            storyboard: (prev.storyboard || []).map(s => s.id === id ? { ...s, videoError: undefined, pendingVideoKey: undefined } : s)
+          };
+        });
+      }
+    };
+    const onFail = (e: any) => {
+      const { jobId, error } = e.detail || {};
+      if (!jobId) return;
+      const id = String(jobId).split('_')[1];
+      if (!id) return;
+      const msg = error || 'Unknown Error';
+      if (jobId.startsWith('asset_')) {
+        patchState(prev => ({ assets: (prev.assets || []).map(a => a.id === id ? { ...a, status: 'FAILED', generationError: error } : a) }));
+      }
+      if (jobId.startsWith('shot_')) {
+        patchState(prev => ({ storyboard: (prev.storyboard || []).map(s => s.id === id ? { ...s, frameError: msg } : s) }));
+      }
+      if (jobId.startsWith('vid_')) {
+        patchState(prev => ({ storyboard: (prev.storyboard || []).map(s => s.id === id ? { ...s, videoError: msg } : s) }));
+      }
+    };
+    window.addEventListener('QUEUE_JOB_COMPLETED', onDone);
+    window.addEventListener('QUEUE_JOB_FAILED', onFail);
+    return () => {
+      window.removeEventListener('QUEUE_JOB_COMPLETED', onDone);
+      window.removeEventListener('QUEUE_JOB_FAILED', onFail);
+    };
+  }, [patchState]);
+  const [hydrate, setHydrate] = useState<{ text: string; busy: boolean } | null>(null);
+  const hydratingRef = useRef(false);
+  const hydrateTriedRef = useRef<Set<string>>(new Set());
+  // โหลดชีทที่มีแค่รหัสในคลัง Flow กลับมาเอง (ภาพช็อตโหลดเฉพาะหน้าที่เปิดดูใน STEP 4 และ STEP 6)
+  useEffect(() => {
+    if (!isLoaded || hydratingRef.current) return;
+    const tried = hydrateTriedRef.current;
+    const ids = Array.from(new Set([
+      ...state.assets.filter(a => !a.referenceBase64 && a.referenceMediaId).map(a => a.referenceMediaId as string)
+    ])).filter(id => !tried.has(id));
+    if (ids.length === 0) return;
+    hydratingRef.current = true;
+    ids.forEach(id => tried.add(id));
+    (async () => {
+      let failed = 0;
+      let got = new Map<string, { base64: string; mimeType: string }>();
+      const flush = () => {
+        if (!got.size) return;
+        const m = got;
+        got = new Map();
+        patchState(prev => ({
+          assets: (prev.assets || []).map(a => !a.referenceBase64 && a.referenceMediaId && m.has(a.referenceMediaId)
+            ? { ...a, referenceBase64: m.get(a.referenceMediaId)!.base64, referenceMimeType: m.get(a.referenceMediaId)!.mimeType } : a)
+        }));
+      };
+      for (let i = 0; i < ids.length; i++) {
+        setHydrate({ text: `กำลังโหลดภาพจากคลัง Flow ${i + 1}/${ids.length}`, busy: true });
+        const r = await resolveMedia(ids[i]);
+        if (r) got.set(ids[i], r); else failed++;
+        if (got.size >= 5) flush();
+      }
+      flush();
+      hydratingRef.current = false;
+      setHydrate(failed ? { text: `โหลดภาพจากคลัง Flow ไม่ได้ ${failed} ภาพ — กด เปิดไฟล์ (ZIP) ที่แถบซ้ายแทน`, busy: false } : null);
+    })();
+  }, [isLoaded, state.assets, patchState]);
+  const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const input = e.target;
+    const file = input.files?.[0];
+    if (!file) return;
+    const exts = ['png', 'jpg', 'jpeg', 'webp'];
+    const mimeOf = (ext: string) => ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg';
+    const toState = (p: any): AppState => ({
+      ...INITIAL_STATE,
+      ...p,
+      script: { ...INITIAL_STATE.script, ...(p?.script || {}) },
+      config: normalizeStyle({ ...INITIAL_STATE.config, ...(p?.config || {}) }),
+      assets: Array.isArray(p?.assets) ? p.assets : [],
+      storyboard: Array.isArray(p?.storyboard) ? p.storyboard : [],
+      videos: Array.isArray(p?.videos) ? p.videos : [],
+      downloadedMediaIds: []
+    });
+    try {
+      setImportStatus('กำลังเปิดไฟล์โปรเจกต์...');
+      let next: AppState;
+      if (file.name.toLowerCase().endsWith('.json')) {
+        next = toState(JSON.parse(await file.text()));
+      } else {
+        const JSZip = (await import('jszip')).default;
+        const zip = await new JSZip().loadAsync(file);
+        const jsonFile = zip.file('project.json');
+        if (!jsonFile) throw new Error('ไม่พบไฟล์ project.json ในไฟล์ ZIP');
+        next = toState(JSON.parse(await jsonFile.async('string')));
+        setImportStatus('กำลังโหลดภาพและวิดีโอ...');
+        for (const a of next.assets) {
+          if (a.status === 'GENERATING') a.status = a.referenceMediaId ? 'READY' : 'NO IMAGE';
+          for (const ext of exts) {
+            const f = zip.file(`assets/${String(a.id).replace('@', '')}.${ext}`);
+            if (f) { a.referenceBase64 = await f.async('base64'); a.referenceMimeType = mimeOf(ext); a.status = 'READY'; break; }
+          }
+        }
+        for (const s of next.storyboard) {
+          const num = String(s.shotNumber).padStart(2, '0');
+          for (const ext of exts) {
+            const f = zip.file(`storyboard/shot_${num}_frame.${ext}`);
+            if (f) { s.firstFrameBase64 = await f.async('base64'); break; }
+          }
+        }
+        for (const v of next.videos) {
+          const shot = next.storyboard.find(s => s.id === v.shotId);
+          const f = zip.file(`videos/shot_${String(shot?.shotNumber || 0).padStart(2, '0')}_video.mp4`);
+          if (f) v.videoBase64 = await f.async('base64');
+        }
+      }
+      setState(next);
+      alert('เปิดโปรเจกต์สำเร็จ');
+    } catch (err) {
+      alert('เปิดไฟล์โปรเจกต์ไม่สำเร็จ: ' + friendlyError(err instanceof Error ? err.message : String(err)));
+    } finally {
+      setImportStatus('');
+      input.value = '';
+    }
+  };
+  const renderStep = () => {
+    switch (currentStep) {
+      case 1: return <Step1Script state={state} onUpdate={handleScriptUpdate} onConfigUpdate={handleConfigUpdate} onNext={() => setCurrentStep(2)} />;
+      case 2: return <Step2Config state={state} onUpdate={handleConfigUpdate} onNavigate={setCurrentStep} onNext={() => setCurrentStep(3)} />;
+      case 3: return <Step3Assets state={state} onUpdate={patchState} onNext={() => setCurrentStep(4)} />;
+      case 4: return <Step4Storyboard state={state} onUpdate={patchState} onConfigUpdate={handleConfigUpdate} onNext={() => setCurrentStep(5)} />;
+      case 5: return <Step5Video state={state} onUpdate={patchState} onNext={() => setCurrentStep(6)} />;
+      case 6: return <Step6Export state={state} onReset={() => { setState(INITIAL_STATE); setCurrentStep(1); sessionStorage.removeItem(STORAGE_KEY); }} onNavigate={setCurrentStep} />;
+      default: return null;
+    }
+  };
+  return (
+    <QueueProvider config={state.config}>
+      <div className="flex h-full w-full bg-[var(--ui-bg)] text-[var(--ui-text-primary)] overflow-hidden relative" data-ui-theme={uiPrefs.theme} data-ui-text-size={uiPrefs.textSize} data-ui-density={uiPrefs.density} style={{ ['--ui-card-min' as any]: `${CARD_MIN_WIDTH[uiPrefs.cardSize]}px` }}>
+        {uiPrefs.theme !== 'light' && <VisualEffects theme={uiPrefs.theme} />}
+        <div className="flex w-full h-full relative z-10 overflow-hidden">
+          <Sidebar currentStep={currentStep} onNavigate={setCurrentStep} onExport={handleSidebarExport} exportProgress={zipProgress} onImport={handleImport} />
+          <main className="flex-1 h-full overflow-y-auto relative flex flex-col">
+            <header className="sticky top-0 z-[55] w-full h-14 shrink-0 bg-[var(--ui-bg)]/80 backdrop-blur-md border-b border-[var(--ui-border)] px-[var(--ui-page-pad)] flex items-center justify-between">
+              <span className="font-extrabold text-[var(--fs-body)] text-[var(--ui-text-primary)] uppercase tracking-tight">
+                {currentStep}. {stepLabel(currentStep)}
+              </span>
+              <div className="relative">
+                <button onClick={() => setShowSettings(!showSettings)} className={`w-9 h-9 rounded-[10px] border flex items-center justify-center transition-all ${showSettings ? 'bg-[var(--ui-primary)] border-[var(--ui-primary)] text-white' : 'bg-transparent border-[var(--ui-border)] text-[var(--ui-text-muted)] hover:border-[var(--ui-border-hover)] hover:text-[var(--ui-text-primary)]'}`}>
+                  <span className="material-symbols-outlined text-[20px] font-bold">settings</span>
+                </button>
+                {showSettings && (
+                  <React.Suspense fallback={null}>
+                    <UISettingsPanel preferences={uiPrefs} onUpdate={setUiPrefs} onClose={() => setShowSettings(false)} />
+                  </React.Suspense>
+                )}
+              </div>
+            </header>
+            <div className="flex-1 p-[var(--ui-page-pad)]">
+              <div className="mx-auto h-full flex flex-col max-w-[1500px]">
+                <React.Suspense fallback={<div className="flex items-center justify-center py-32 text-[var(--ui-text-muted)] font-bold">กำลังเปิดขั้นตอน...</div>}>
+                  {renderStep()}
+                </React.Suspense>
+              </div>
+            </div>
+          </main>
+        </div>
+        <QueuePanel />
+        {autosaveFailed && (
+          <div className="fixed top-3 left-1/2 -translate-x-1/2 -translate-y-0 z-[500] flex items-center gap-3 px-5 py-3 bg-[var(--ui-danger)] text-white rounded-xl shadow-2xl">
+            <span className="material-symbols-outlined font-bold">warning</span>
+            <span className="font-bold" style={{ fontSize: 'var(--fs-small)' }}>บันทึกอัตโนมัติไม่สำเร็จ — กด "บันทึก" ที่แถบซ้ายเก็บไฟล์ ZIP ไว้ก่อน</span>
+            <button onClick={() => setAutosaveFailed(false)} className="material-symbols-outlined">close</button>
+          </div>
+        )}
+        {hydrate && (
+          <div className="fixed bottom-24 left-1/2 -translate-x-1/2 z-[450] flex items-center gap-3 px-4 py-2 rounded-full bg-[var(--ui-surface-raised)] border border-[var(--ui-border)] shadow-2xl">
+            {hydrate.busy
+              ? <div className="w-4 h-4 border-2 border-[var(--ui-accent)] border-t-transparent rounded-full animate-spin" />
+              : <span className="material-symbols-outlined text-[var(--ui-accent)]">info</span>}
+            <span className="font-bold text-[var(--ui-text-primary)]" style={{ fontSize: 'var(--fs-small)' }}>{hydrate.text}</span>
+            {!hydrate.busy && <button onClick={() => setHydrate(null)} className="material-symbols-outlined text-[var(--ui-text-muted)] text-xs">close</button>}
+          </div>
+        )}
+        {importStatus && (
+          <div className="fixed inset-0 z-[400] bg-black/70 backdrop-blur-sm flex flex-col items-center justify-center gap-4">
+            <div className="w-12 h-12 border-4 border-[var(--ui-accent)] border-t-transparent rounded-full animate-spin" />
+            <p className="font-bold text-white" style={{ fontSize: 'var(--fs-body)' }}>{importStatus}</p>
+          </div>
+        )}
+      </div>
+    </QueueProvider>
+  );
+}
