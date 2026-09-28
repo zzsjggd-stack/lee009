@@ -1,0 +1,15 @@
+export const friendlyError = (raw?: string): string => {
+  const t = String(raw || '').trim();
+  if (!t) return 'เกิดข้อผิดพลาด — ลองใหม่อีกครั้ง';
+  if (/CANCELLED/i.test(t)) return 'ยกเลิกแล้ว';
+  if (/TIMEOUT/i.test(t)) return 'AI ใช้เวลานานเกินไป — ลองใหม่อีกครั้ง';
+  if (/\bGj\b/.test(t)) return 'Flow ไม่รับคำขอนี้ — ลองใหม่อีกครั้ง';
+  if (/\b429\b|rate.?limit|quota|RESOURCE_EXHAUSTED/i.test(t)) return 'ใช้งานถี่เกินไป — รอสักครู่แล้วลองใหม่';
+  if (/safety|blocked|policy|prohibited/i.test(t)) return 'เนื้อหาถูกระบบกรองของ Flow — ปรับคำบรรยายแล้วลองใหม่';
+  if (/Expected object response with media fields|no media|media fields/i.test(t)) return 'โมเดลไม่ส่งภาพกลับมา — มักเกิดจากคำบรรยายถูกระบบกรอง ลองแก้คำบรรยายหรือเปลี่ยนโมเดลภาพใน STEP 2 แล้วลองใหม่';
+  if (/deadline|unavailable|503|502|500|internal/i.test(t)) return 'ระบบ Flow ขัดข้องชั่วคราว — รอสักครู่แล้วกดลองใหม่';
+  if (/network|fetch|connection|offline/i.test(t)) return 'เชื่อมต่อไม่ได้ — ตรวจอินเทอร์เน็ตแล้วลองใหม่';
+  if (/อ่าน JSON ไม่ได้|AI ตอบว่าง|ไม่ได้ส่งข้อความกลับ|ไม่ได้ส่งรายการ/.test(t)) return 'AI ตอบกลับไม่ครบ — ลองใหม่อีกครั้ง';
+  if (/Error|::|[{}]|stack/i.test(t)) return 'เกิดข้อผิดพลาด — ลองใหม่อีกครั้ง';
+  return t;
+};

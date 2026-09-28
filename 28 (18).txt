@@ -1,0 +1,160 @@
+}
+export class LegacyWordError extends Error {
+  constructor() {
+    super('ไฟล์ .doc รุ่นเก่ายังไม่รองรับ กรุณาบันทึกเป็น .docx แล้วลองอีกครั้ง');
+    this.name = 'LegacyWordError';
+  }
+}
+/**
+ * Normalizes imported text: fix line breaks, remove nulls, trim.
+ */
+export const normalizeImportedText = (text: string): string => {
+  return text
+    .replace(/\r\n?/g, '\n')         // CRLF -> LF
+    .replace(/\u0000/g, '')          // Remove null chars
+    .replace(/\n{4,}/g, '\n\n\n')    // Collapse excessive line breaks
+    .trim();
+};
+/**
+ * Central entry point for parsing script files.
+ */
+export async function parseScriptFile(file: File): Promise<string> {
+  const extension = file.name.split('.').pop()?.toLowerCase();
+  if (extension === 'doc') {
+    throw new LegacyWordError();
+  }
+  switch (extension) {
+    case 'txt':
+    case 'md':
+    case 'markdown':
+    case 'fountain':
+    case 'srt':
+    case 'vtt':
+    case 'csv':
+    case 'json':
+      return await file.text();
+    case 'docx':
+      return await parseDocx(file);
+    case 'rtf':
+      return parseRtf(await file.text());
+    case 'odt':
+      return await parseOdt(file);
+    case 'html':
+    case 'htm':
+      return parseHtml(await file.text());
+    case 'fdx':
+      return parseFinalDraft(await file.text());
+    case 'pdf':
+      throw new Error('ไฟล์ PDF ไม่รองรับแล้ว กรุณาคัดลอกข้อความมาวาง หรือบันทึกเป็น .txt / .docx');
+    default:
+      if (file.type === 'text/plain') return await file.text();
+      throw new UnsupportedFileError(extension || 'unknown');
+  }
+}
+async function parseDocx(file: File) {
+  const mammoth = (await import('mammoth')).default;
+  const arrayBuffer = await file.arrayBuffer();
+  const result = await mammoth.extractRawText({ arrayBuffer });
+  return result.value;
+}
+async function parseOdt(file: File): Promise<string> {
+  const JSZip = (await import('jszip')).default;
+  const zip = new JSZip();
+  const loadedZip = await zip.loadAsync(file);
+  const contentXml = await loadedZip.file('content.xml')?.async('text');
+  
+  if (!contentXml) throw new Error('ไม่พบเนื้อหาในไฟล์ ODT');
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(contentXml, 'text/xml');
+  const textElements = Array.from(doc.querySelectorAll('p, h'));
+  return textElements.map(el => el.textContent).join('\n\n');
+}
+function parseHtml(html: string): string {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, 'text/html');
+  const scripts = doc.querySelectorAll('script, style, noscript');
+  scripts.forEach(s => s.remove());
+  return doc.body.innerText || doc.body.textContent || '';
+}
+function parseFinalDraft(xml: string): string {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(xml, 'text/xml');
+  const paragraphs = doc.getElementsByTagName('Paragraph');
+  
+  let result = '';
+  for (let i = 0; i < paragraphs.length; i++) {
+    const p = paragraphs[i];
+    const type = p.getAttribute('Type');
+    const text = p.textContent?.trim() || '';
+    if (!text) continue;
+    switch (type) {
+      case 'Scene Heading': case 'Character': case 'Transition':
+        result += `\n${text.toUpperCase()}\n`;
+        break;
+      case 'Dialogue': case 'Parenthetical':
+        result += `${text}\n`;
+        break;
+      default:
+        result += `\n${text}\n`;
+        break;
+    }
+  }
+  return result.trim();
+}
+// แปลง RTF เป็นข้อความ รองรับภาษาไทย — เขียนโดยไม่มีเครื่องหมายแบ็กสแลชในโค้ด กันโค้ดเพี้ยนตอนบันทึกไฟล์
+function parseRtf(rtf: string): string {
+  const BS = String.fromCharCode(92), LF = String.fromCharCode(10), CR = String.fromCharCode(13), TAB = String.fromCharCode(9), QUOTE = String.fromCharCode(39);
+  const isLetter = (c: string) => (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+  const isDigit = (c: string) => c >= '0' && c <= '9';
+  const isHex = (c: string) => isDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+  let cp = '';
+  const cpAt = rtf.indexOf(BS + 'ansicpg');
+  if (cpAt >= 0) { let k = cpAt + 8; while (k < rtf.length && isDigit(rtf[k])) cp += rtf[k++]; }
+  let decoder: TextDecoder;
+  try { decoder = new TextDecoder(cp ? 'windows-' + cp : 'windows-1252'); } catch { decoder = new TextDecoder('windows-1252'); }
+  const SKIP = new Set(['fonttbl', 'colortbl', 'stylesheet', 'info', 'pict', 'header', 'footer', 'headerl', 'headerr', 'footerl', 'footerr', 'listtable', 'listoverridetable', 'rsidtbl', 'generator', 'xmlnstbl', 'themedata', 'colorschememapping', 'latentstyles', 'datastore', 'fldinst', 'object']);
+  const stack: { skip: boolean; uc: number }[] = [];
+  let skip = false, uc = 1, pending = 0, out = '';
+  let bytes: number[] = [];
+  const flush = () => { if (bytes.length) { out += decoder.decode(new Uint8Array(bytes)); bytes = []; } };
+  const put = (t: string) => { if (!skip) { flush(); out += t; } };
+  let i = 0;
+  while (i < rtf.length) {
+    const ch = rtf[i];
+    if (ch === '{') { stack.push({ skip, uc }); i++; continue; }
+    if (ch === '}') { flush(); const st = stack.pop(); if (st) { skip = st.skip; uc = st.uc; } i++; continue; }
+    if (ch === CR || ch === LF) { i++; continue; }
+    if (ch !== BS) { if (pending > 0) pending--; else put(ch); i++; continue; }
+    const next = rtf[i + 1] || '';
+    if (next === QUOTE) {
+      const hex = rtf.slice(i + 2, i + 4); i += 4;
+      if (pending > 0) { pending--; continue; }
+      if (!skip && isHex(hex[0] || '') && isHex(hex[1] || '')) bytes.push(parseInt(hex, 16));
+      continue;
+    }
+    if (isLetter(next)) {
+      let k = i + 1, word = '', num = '';
+      while (k < rtf.length && isLetter(rtf[k])) word += rtf[k++];
+      if (rtf[k] === '-' && isDigit(rtf[k + 1] || '')) num += rtf[k++];
+      while (k < rtf.length && isDigit(rtf[k])) num += rtf[k++];
+      if (rtf[k] === ' ') k++;
+      i = k;
+      const arg = num ? parseInt(num, 10) : undefined;
+      if (SKIP.has(word)) { skip = true; continue; }
+      if (word === 'uc' && arg !== undefined) { uc = arg; continue; }
+      if (word === 'u' && arg !== undefined) { put(String.fromCharCode(arg < 0 ? arg + 65536 : arg)); pending = uc; continue; }
+      if (word === 'par' || word === 'line' || word === 'sect' || word === 'page') { put(LF); continue; }
+      if (word === 'tab') { put(TAB); continue; }
+      continue;
+    }
+    if (next === '*') { skip = true; i += 2; continue; }
+    if (next === BS || next === '{' || next === '}') { if (pending > 0) pending--; else put(next); i += 2; continue; }
+    if (next === '~') { put(' '); i += 2; continue; }
+    if (next === CR || next === LF) { put(LF); i += 2; continue; }
+    i += 2;
+  }
+  flush();
+  let text = out.split(LF).map(l => l.trimEnd()).join(LF);
+  while (text.includes(LF + LF + LF)) text = text.split(LF + LF + LF).join(LF + LF);
+  return text.trim();
+}
